@@ -184,6 +184,13 @@
           }
         } catch (e) {}
 
+        try {
+          if (videoEl.__localweb_restore_audio_timer__) {
+            clearTimeout(videoEl.__localweb_restore_audio_timer__);
+            videoEl.__localweb_restore_audio_timer__ = null;
+          }
+        } catch (e) {}
+
         if (videoEl.__localweb_prev_muted__ === undefined) {
           try { videoEl.__localweb_prev_muted__ = !!videoEl.muted; } catch (e) {}
         }
@@ -211,26 +218,58 @@
           } catch (e) {}
         }
 
-        try { videoEl.muted = true; } catch (e) {}
-        try { if (typeof videoEl.volume === 'number') videoEl.volume = 0; } catch (e) {}
+        // Avoid toggling muted on/off (can pop on some WebView builds). Instead, do a fast fade-out to 0.
+        try {
+          if (typeof videoEl.volume === 'number') {
+            var startV = 1;
+            try { startV = Number(videoEl.volume); } catch (e) {}
+            if (!isFinite(startV)) startV = 1;
+            startV = Math.max(0, Math.min(1, startV));
+
+            var stepsOut = 5;
+            var outMs = 60;
+            var stepOutMs = Math.max(10, Math.round(outMs / stepsOut));
+            var iOut = 0;
+            videoEl.__localweb_fade_timer__ = setInterval(function() {
+              try {
+                iOut++;
+                var vOut = startV * (1 - (iOut / stepsOut));
+                if (vOut < 0.001) vOut = 0;
+                videoEl.volume = vOut;
+                if (iOut >= stepsOut) {
+                  clearInterval(videoEl.__localweb_fade_timer__);
+                  videoEl.__localweb_fade_timer__ = null;
+                  videoEl.volume = 0;
+                }
+              } catch (e) {
+                try {
+                  clearInterval(videoEl.__localweb_fade_timer__);
+                  videoEl.__localweb_fade_timer__ = null;
+                } catch (e2) {}
+              }
+            }, stepOutMs);
+          }
+        } catch (e) {}
+
+        videoEl.__localweb_audio_suppressed__ = true;
       } else {
         var prevMuted = (videoEl.__localweb_prev_muted__ !== undefined) ? !!videoEl.__localweb_prev_muted__ : null;
         var prevVolume = (videoEl.__localweb_prev_volume__ !== undefined) ? Number(videoEl.__localweb_prev_volume__) : null;
 
-        // Restore muted state first.
-        if (prevMuted !== null) {
-          try { videoEl.muted = prevMuted; } catch (e) {}
-          videoEl.__localweb_prev_muted__ = undefined;
-        }
-
-        // If the user intended it muted, keep volume at 0 and stop here.
+        // If the user intended it muted, keep it muted and stop here.
         if (prevMuted === true) {
+          try { videoEl.muted = true; } catch (e) {}
           try { if (typeof videoEl.volume === 'number') videoEl.volume = 0; } catch (e) {}
+          videoEl.__localweb_prev_muted__ = undefined;
           videoEl.__localweb_prev_volume__ = undefined;
+          videoEl.__localweb_audio_suppressed__ = false;
           return;
         }
 
-        // Fade volume in over ~100ms to avoid scratchy remnants/pops.
+        // Keep muted=false (don’t toggle) and fade volume in to avoid pops.
+        try { videoEl.muted = false; } catch (e) {}
+
+        // Fade volume in over ~200ms to avoid scratchy remnants/pops.
         if (prevVolume !== null && isFinite(prevVolume)) {
           try {
             if (typeof videoEl.volume === 'number') {
@@ -238,8 +277,8 @@
               var target = Math.max(0, Math.min(1, prevVolume));
               // Keep desired volume in sync with restored value.
               try { videoEl.__localweb_desired_volume__ = target; } catch (e) {}
-              var steps = 6;
-              var stepMs = 100 / steps;
+              var steps = 10;
+              var stepMs = 200 / steps;
               var i = 0;
               try {
                 if (videoEl.__localweb_fade_timer__) {
@@ -268,7 +307,32 @@
           } catch (e) {}
           videoEl.__localweb_prev_volume__ = undefined;
         }
+
+        videoEl.__localweb_prev_muted__ = undefined;
+        videoEl.__localweb_audio_suppressed__ = false;
       }
+    } catch (e) {}
+  }
+
+  function scheduleAudioRestore(videoEl, reason) {
+    try {
+      if (!videoEl) return;
+      if (videoEl.__localweb_restore_audio_timer__) {
+        clearTimeout(videoEl.__localweb_restore_audio_timer__);
+        videoEl.__localweb_restore_audio_timer__ = null;
+      }
+
+      // Wait a moment after "playing/canplay"; WebView can still pop if we restore immediately.
+      videoEl.__localweb_restore_audio_timer__ = setTimeout(function() {
+        try {
+          videoEl.__localweb_restore_audio_timer__ = null;
+          if (videoEl.classList && videoEl.classList.contains('__localweb_loading')) return;
+          if (!videoEl.__localweb_audio_suppressed__) return;
+          setVideoAudioSuppressed(videoEl, false);
+        } catch (e) {}
+      }, 120);
+
+      try { console.log('[media-debug] schedule audio restore:', reason || ''); } catch (e) {}
     } catch (e) {}
   }
 
@@ -405,8 +469,8 @@
           console.log('[media-debug] ui:video-loading=0 reason=' + (reason || ''));
         }
         hideLoadingOverlay();
-        // Restore audio once the new media is ready.
-        setVideoAudioSuppressed(videoEl, false);
+        // Restore audio once the new media is ready, but with a slight delay to reduce pops.
+        scheduleAudioRestore(videoEl, reason || 'ready');
       }
     } catch (e) {}
   }
@@ -436,6 +500,16 @@
       videoEl.style.display = 'block';
       videoEl.style.visibility = 'visible';
       videoEl.style.opacity = '1';
+
+      // Important: don't steal taps/clicks from the page's own controls (e.g., edge prev/next hit areas).
+      // This overlay fix exists to make video visible in buggy WebView layouts; the web app should still
+      // receive input events through it.
+      try {
+        if (videoEl.__localweb_prev_pointer_events__ === undefined) {
+          videoEl.__localweb_prev_pointer_events__ = videoEl.style.pointerEvents;
+        }
+        videoEl.style.pointerEvents = 'none';
+      } catch (e) {}
 
       console.log('[media-debug] applied video overlay fix:', 'reason=' + (reason || ''), 'src=' + (videoEl.currentSrc || videoEl.src || ''));
     } catch (e) {
@@ -624,6 +698,59 @@
     try { console.log('[media-debug] ui:' + msg); } catch (e) {}
   }
 
+  function preemptiveSilenceActiveVideo(reason) {
+    try {
+      var v = null;
+      try { v = getPrimaryVideo && getPrimaryVideo(); } catch (e) {}
+      if (!v) {
+        try { v = document.querySelector && document.querySelector('video'); } catch (e) {}
+      }
+      if (!v) return;
+
+      // If we are already in the middle of a transition, don't fight it.
+      try {
+        if (v.classList && v.classList.contains('__localweb_loading')) {
+          return;
+        }
+      } catch (e) {}
+
+      // Capture restore state once.
+      if (v.__localweb_prev_muted__ === undefined) {
+        try { v.__localweb_prev_muted__ = !!v.muted; } catch (e) {}
+      }
+      if (v.__localweb_prev_volume__ === undefined) {
+        try {
+          var vv = (v.__localweb_desired_volume__ !== undefined) ? Number(v.__localweb_desired_volume__) : null;
+          if (!(vv !== null && isFinite(vv))) {
+            vv = (typeof v.volume === 'number') ? v.volume : 1;
+          }
+          v.__localweb_prev_volume__ = vv;
+        } catch (e) {}
+      }
+
+      // Cancel any pending fades/restores and hard-set volume to 0 BEFORE the page swaps src.
+      try {
+        if (v.__localweb_fade_timer__) {
+          clearInterval(v.__localweb_fade_timer__);
+          v.__localweb_fade_timer__ = null;
+        }
+      } catch (e) {}
+      try {
+        if (v.__localweb_restore_audio_timer__) {
+          clearTimeout(v.__localweb_restore_audio_timer__);
+          v.__localweb_restore_audio_timer__ = null;
+        }
+      } catch (e) {}
+
+      try {
+        if (typeof v.volume === 'number') v.volume = 0;
+      } catch (e) {}
+      v.__localweb_audio_suppressed__ = true;
+
+      try { console.log('[media-debug] preemptive silence:', reason || ''); } catch (e) {}
+    } catch (e) {}
+  }
+
   // ---- Soft fullscreen (CSS-based; avoids WebView custom view swaps) ----
   // This keeps playback on the same <video> element to reduce/avoid A/V interruption.
   function getPrimaryVideo() {
@@ -689,7 +816,8 @@
         backgroundColor: videoEl.style.backgroundColor,
         display: videoEl.style.display,
         visibility: videoEl.style.visibility,
-        opacity: videoEl.style.opacity
+        opacity: videoEl.style.opacity,
+        pointerEvents: videoEl.style.pointerEvents
       };
 
       softFullscreenSetOverflow(true);
@@ -704,11 +832,16 @@
       videoEl.style.maxWidth = '100vw';
       videoEl.style.maxHeight = '100vh';
       videoEl.style.objectFit = 'contain';
-      videoEl.style.zIndex = '2147483646';
+      // Keep below the app's overlay controls (edge prev/next hit targets, center controls).
+      // If we set an extreme z-index, the invisible edge buttons won't receive taps.
+      videoEl.style.zIndex = '2';
       videoEl.style.backgroundColor = 'black';
       videoEl.style.display = 'block';
       videoEl.style.visibility = 'visible';
       videoEl.style.opacity = '1';
+
+      // Let overlay controls receive taps; the app uses its own hit layers.
+      videoEl.style.pointerEvents = 'none';
 
       videoEl.__localweb_soft_fullscreen_active__ = true;
       window.__localweb_soft_fullscreen_active__ = true;
@@ -740,6 +873,7 @@
         videoEl.style.display = prev.display || '';
         videoEl.style.visibility = prev.visibility || '';
         videoEl.style.opacity = prev.opacity || '';
+        videoEl.style.pointerEvents = prev.pointerEvents || '';
       } else {
         videoEl.style.position = '';
         videoEl.style.left = '';
@@ -756,6 +890,7 @@
         videoEl.style.display = '';
         videoEl.style.visibility = '';
         videoEl.style.opacity = '';
+        videoEl.style.pointerEvents = '';
       }
 
       videoEl.__localweb_soft_fullscreen_prev_style__ = undefined;
@@ -816,6 +951,21 @@
       try {
         document.addEventListener(t, function(ev) {
           try {
+            // Preemptive silence for known prev/next controls. Use capture-phase so we run
+            // before the app swaps the media source.
+            try {
+              var el = ev && ev.target;
+              var cur = el;
+              while (cur && cur !== document.documentElement) {
+                var id = cur && cur.id ? String(cur.id) : '';
+                if (id === 'centerPrevBtn' || id === 'centerNextBtn' || id === 'centerEdgePrevBtn' || id === 'centerEdgeNextBtn') {
+                  preemptiveSilenceActiveVideo('ui:' + id + ':' + t);
+                  break;
+                }
+                cur = cur.parentElement;
+              }
+            } catch (e) {}
+
             if (isVideoEl(ev && ev.target)) {
               logHostSignal('video-touch');
             }
@@ -823,6 +973,18 @@
         }, true);
       } catch (e) {}
     });
+
+  // Also preemptively silence on common keyboard navigation shortcuts.
+  try {
+    document.addEventListener('keydown', function(ev) {
+      try {
+        var k = ev && (ev.key || ev.code) ? String(ev.key || ev.code) : '';
+        if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'MediaTrackPrevious' || k === 'MediaTrackNext') {
+          preemptiveSilenceActiveVideo('key:' + k);
+        }
+      } catch (e) {}
+    }, true);
+  } catch (e) {}
 
   console.log('[media-debug] installed');
 })();

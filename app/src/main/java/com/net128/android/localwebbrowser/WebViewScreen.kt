@@ -703,8 +703,6 @@ fun WebViewScreen(
                             settings.domStorageEnabled = true
                             settings.allowContentAccess = true
                             settings.allowFileAccess = true
-                            settings.allowUniversalAccessFromFileURLs = true
-                            settings.allowFileAccessFromFileURLs = true
                             settings.useWideViewPort = true
                             settings.loadWithOverviewMode = true
                             settings.textZoom = 100
