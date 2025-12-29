@@ -624,6 +624,175 @@
     try { console.log('[media-debug] ui:' + msg); } catch (e) {}
   }
 
+  // ---- Soft fullscreen (CSS-based; avoids WebView custom view swaps) ----
+  // This keeps playback on the same <video> element to reduce/avoid A/V interruption.
+  function getPrimaryVideo() {
+    try {
+      var vids = document.querySelectorAll ? document.querySelectorAll('video') : null;
+      if (!vids || !vids.length) return null;
+      // Prefer a currently-playing video.
+      for (var i = 0; i < vids.length; i++) {
+        var v = vids[i];
+        try {
+          if (v && !v.paused && !v.ended) return v;
+        } catch (e) {}
+      }
+      return vids[0];
+    } catch (e) {}
+    return null;
+  }
+
+  function softFullscreenSetOverflow(on) {
+    try {
+      var de = document.documentElement;
+      var body = document.body;
+      if (on) {
+        if (de && de.__localweb_prev_overflow__ === undefined) de.__localweb_prev_overflow__ = de.style.overflow;
+        if (body && body.__localweb_prev_overflow__ === undefined) body.__localweb_prev_overflow__ = body.style.overflow;
+        if (de) de.style.overflow = 'hidden';
+        if (body) body.style.overflow = 'hidden';
+      } else {
+        if (de) {
+          de.style.overflow = (de.__localweb_prev_overflow__ !== undefined) ? de.__localweb_prev_overflow__ : '';
+          de.__localweb_prev_overflow__ = undefined;
+        }
+        if (body) {
+          body.style.overflow = (body.__localweb_prev_overflow__ !== undefined) ? body.__localweb_prev_overflow__ : '';
+          body.__localweb_prev_overflow__ = undefined;
+        }
+      }
+    } catch (e) {}
+  }
+
+  function softFullscreenApply(videoEl) {
+    try {
+      if (!videoEl || !videoEl.style) return false;
+      if (videoEl.__localweb_soft_fullscreen_active__) return true;
+
+      // If transition logic hid it, unhide.
+      try { setVideoHiddenForSwitch(videoEl, false); } catch (e) {}
+      try { if (videoEl.classList) videoEl.classList.remove('__localweb_loading'); } catch (e) {}
+      try { hideLoadingOverlay(); } catch (e) {}
+
+      videoEl.__localweb_soft_fullscreen_prev_style__ = {
+        position: videoEl.style.position,
+        left: videoEl.style.left,
+        top: videoEl.style.top,
+        right: videoEl.style.right,
+        bottom: videoEl.style.bottom,
+        width: videoEl.style.width,
+        height: videoEl.style.height,
+        maxWidth: videoEl.style.maxWidth,
+        maxHeight: videoEl.style.maxHeight,
+        objectFit: videoEl.style.objectFit,
+        zIndex: videoEl.style.zIndex,
+        backgroundColor: videoEl.style.backgroundColor,
+        display: videoEl.style.display,
+        visibility: videoEl.style.visibility,
+        opacity: videoEl.style.opacity
+      };
+
+      softFullscreenSetOverflow(true);
+
+      videoEl.style.position = 'fixed';
+      videoEl.style.left = '0';
+      videoEl.style.top = '0';
+      videoEl.style.right = '0';
+      videoEl.style.bottom = '0';
+      videoEl.style.width = '100vw';
+      videoEl.style.height = '100vh';
+      videoEl.style.maxWidth = '100vw';
+      videoEl.style.maxHeight = '100vh';
+      videoEl.style.objectFit = 'contain';
+      videoEl.style.zIndex = '2147483646';
+      videoEl.style.backgroundColor = 'black';
+      videoEl.style.display = 'block';
+      videoEl.style.visibility = 'visible';
+      videoEl.style.opacity = '1';
+
+      videoEl.__localweb_soft_fullscreen_active__ = true;
+      window.__localweb_soft_fullscreen_active__ = true;
+      logHostSignal('fullscreen=1');
+      return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function softFullscreenRestore(videoEl) {
+    try {
+      if (!videoEl || !videoEl.style) return false;
+      if (!videoEl.__localweb_soft_fullscreen_active__) return true;
+
+      var prev = videoEl.__localweb_soft_fullscreen_prev_style__ || null;
+      if (prev) {
+        videoEl.style.position = prev.position || '';
+        videoEl.style.left = prev.left || '';
+        videoEl.style.top = prev.top || '';
+        videoEl.style.right = prev.right || '';
+        videoEl.style.bottom = prev.bottom || '';
+        videoEl.style.width = prev.width || '';
+        videoEl.style.height = prev.height || '';
+        videoEl.style.maxWidth = prev.maxWidth || '';
+        videoEl.style.maxHeight = prev.maxHeight || '';
+        videoEl.style.objectFit = prev.objectFit || '';
+        videoEl.style.zIndex = prev.zIndex || '';
+        videoEl.style.backgroundColor = prev.backgroundColor || '';
+        videoEl.style.display = prev.display || '';
+        videoEl.style.visibility = prev.visibility || '';
+        videoEl.style.opacity = prev.opacity || '';
+      } else {
+        videoEl.style.position = '';
+        videoEl.style.left = '';
+        videoEl.style.top = '';
+        videoEl.style.right = '';
+        videoEl.style.bottom = '';
+        videoEl.style.width = '';
+        videoEl.style.height = '';
+        videoEl.style.maxWidth = '';
+        videoEl.style.maxHeight = '';
+        videoEl.style.objectFit = '';
+        videoEl.style.zIndex = '';
+        videoEl.style.backgroundColor = '';
+        videoEl.style.display = '';
+        videoEl.style.visibility = '';
+        videoEl.style.opacity = '';
+      }
+
+      videoEl.__localweb_soft_fullscreen_prev_style__ = undefined;
+      videoEl.__localweb_soft_fullscreen_active__ = false;
+      window.__localweb_soft_fullscreen_active__ = false;
+      softFullscreenSetOverflow(false);
+
+      logHostSignal('fullscreen=0');
+      return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // Expose helpers for the Android host.
+  window.__localweb_soft_fullscreen_enter__ = function() {
+    try {
+      var v = getPrimaryVideo();
+      if (!v) return false;
+      return softFullscreenApply(v);
+    } catch (e) {}
+    return false;
+  };
+
+  window.__localweb_soft_fullscreen_exit__ = function() {
+    try {
+      var v = getPrimaryVideo();
+      if (!v) {
+        // Still notify host.
+        window.__localweb_soft_fullscreen_active__ = false;
+        logHostSignal('fullscreen=0');
+        return true;
+      }
+      return softFullscreenRestore(v);
+    } catch (e) {}
+    return false;
+  };
+
   try {
     document.addEventListener('fullscreenchange', function() {
       try {

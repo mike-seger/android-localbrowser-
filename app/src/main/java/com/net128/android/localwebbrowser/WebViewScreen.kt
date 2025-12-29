@@ -126,6 +126,14 @@ fun WebViewScreen(
             )
         }
 
+        // Exit our soft fullscreen mode (CSS-based), if active.
+        runCatching {
+            webViewRef?.evaluateJavascript(
+                "try{window.__localweb_soft_fullscreen_exit__&&window.__localweb_soft_fullscreen_exit__();}catch(e){}",
+                null
+            )
+        }
+
         // If we were only in page fullscreen (no custom view), restore system UI now.
         // Otherwise onHideCustomView() will restore it.
         if (!hadCustomView) {
@@ -732,14 +740,21 @@ fun WebViewScreen(
 
                                 override fun onShowCustomView(view: View?, callback: WebChromeClient.CustomViewCallback?) {
                                     Log.d(logTag, "webChromeClient.onShowCustomView: view=${view?.javaClass?.name}")
-                                    if (view != null) {
-                                        customView = view
-                                        customViewCallback = callback
-                                        pageFullscreenRequested = true
-                                        showExitFullscreen = false
-                                        setSystemBarsHidden(true)
-                                    } else {
-                                        super.onShowCustomView(view, callback)
+
+                                    // Prefer a CSS-based "soft fullscreen" to avoid interrupting A/V by swapping
+                                    // into WebView's native fullscreen custom view.
+                                    runCatching { callback?.onCustomViewHidden() }
+                                    customView = null
+                                    customViewCallback = null
+                                    pageFullscreenRequested = true
+                                    // Entering fullscreen is a user action; show the exit affordance.
+                                    showExitFullscreen = true
+                                    setSystemBarsHidden(true)
+                                    runCatching {
+                                        webViewRef?.evaluateJavascript(
+                                            "try{window.__localweb_soft_fullscreen_enter__&&window.__localweb_soft_fullscreen_enter__();}catch(e){}",
+                                            null
+                                        )
                                     }
                                 }
 
