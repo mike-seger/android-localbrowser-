@@ -110,21 +110,27 @@ fun WebViewScreen(
     }
 
     fun exitFullscreen() {
-        // 1) Exit WebView custom view fullscreen (video).
+        // Request WebView to exit custom view fullscreen (video).
+        // Do NOT clear customView/customViewCallback here: WebView will call onHideCustomView()
+        // and we clear state there. Clearing early can race and leave the renderer stuck.
+        val hadCustomView = (customView != null) || (customViewCallback != null)
         runCatching { customViewCallback?.onCustomViewHidden() }
-        customViewCallback = null
-        customView = null
+
+        // Ask the page to exit Fullscreen API if it used it.
         pageFullscreenRequested = false
         showExitFullscreen = false
-
-        // 2) Ask the page to exit Fullscreen API if it used it.
         runCatching {
             webViewRef?.evaluateJavascript(
                 "try{document.exitFullscreen&&document.exitFullscreen();}catch(e){}",
                 null
             )
         }
-        setSystemBarsHidden(false)
+
+        // If we were only in page fullscreen (no custom view), restore system UI now.
+        // Otherwise onHideCustomView() will restore it.
+        if (!hadCustomView) {
+            setSystemBarsHidden(false)
+        }
     }
 
     DisposableEffect(isFullscreen) {
@@ -745,6 +751,17 @@ fun WebViewScreen(
                                     showExitFullscreen = false
                                     setSystemBarsHidden(false)
 
+                                    // If fullscreen exit interrupts our transition handlers, the video can be left
+                                    // opacity:0/visibility:hidden (and/or with __localweb_loading set). Force-clear.
+                                    try {
+                                        webViewRef?.evaluateJavascript(
+                                            "try{var v=document.querySelector('video');if(v){try{v.classList&&v.classList.remove('__localweb_loading');}catch(e){};var o=document.getElementById('__localweb_video_loading_overlay');if(o){try{o.classList&&o.classList.remove('__show');}catch(e){}};if(v.__localweb_prev_opacity__!==undefined){v.style.opacity=v.__localweb_prev_opacity__;v.__localweb_prev_opacity__=undefined;}else{v.style.opacity='';}if(v.__localweb_prev_visibility__!==undefined){v.style.visibility=v.__localweb_prev_visibility__;v.__localweb_prev_visibility__=undefined;}else{v.style.visibility='';}}}catch(e){}",
+                                            null
+                                        )
+                                    } catch (_: Exception) {
+                                        // ignore
+                                    }
+
                                     // WebView often pauses the media when leaving fullscreen; try to resume inline.
                                     try {
                                         webViewRef?.postDelayed({
@@ -752,6 +769,13 @@ fun WebViewScreen(
                                                 "try{var v=document.querySelector('video'); if(v && v.paused && !v.ended){ v.play(); }}catch(e){}",
                                                 null
                                             )
+                                            // Nudge layout/draw after fullscreen teardown.
+                                            try {
+                                                webViewRef?.requestLayout()
+                                                webViewRef?.invalidate()
+                                            } catch (_: Exception) {
+                                                // ignore
+                                            }
                                         }, 150)
                                     } catch (_: Exception) {
                                         // ignore
@@ -808,8 +832,9 @@ fun WebViewScreen(
                     update = { webView ->
                         if (webViewRef !== webView) webViewRef = webView
 
-                        // Keep WebView alive but avoid it drawing over the custom view.
-                        webView.visibility = if (customView != null) View.INVISIBLE else View.VISIBLE
+                        // Keep WebView attached and visible even while fullscreen custom view is shown.
+                        // Hiding it (INVISIBLE/GONE) can lead to stuck video rendering after exiting fullscreen.
+                        webView.visibility = View.VISIBLE
 
                         if (isLocalMode) {
                             // Load the HTML itself via SAF, but give it a stable base URL so
