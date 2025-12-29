@@ -173,68 +173,6 @@
     } catch (e) {}
   }
 
-  // Some WebView builds still flash a native play glyph even when opacity/visibility are hidden.
-  // As an extra mitigation, temporarily collapse the video element's rendered size to 0 for a short
-  // period right after we detect a source switch.
-  function setVideoCollapsedForSwitch(videoEl, on, minMs) {
-    try {
-      if (!videoEl || !videoEl.style) return;
-
-      // Ensure timers don't pile up.
-      try {
-        if (videoEl.__localweb_uncollapse_timer__) {
-          clearTimeout(videoEl.__localweb_uncollapse_timer__);
-          videoEl.__localweb_uncollapse_timer__ = null;
-        }
-      } catch (e) {}
-
-      if (on) {
-        if (!videoEl.__localweb_prev_size_style__) {
-          videoEl.__localweb_prev_size_style__ = {
-            width: videoEl.style.width,
-            height: videoEl.style.height,
-            maxWidth: videoEl.style.maxWidth,
-            maxHeight: videoEl.style.maxHeight,
-          };
-        }
-
-        videoEl.__localweb_collapsed_for_switch__ = true;
-
-        // Collapse hard to zero (user requested). Keep hidden styles separate.
-        videoEl.style.width = '0px';
-        videoEl.style.height = '0px';
-        videoEl.style.maxWidth = '0px';
-        videoEl.style.maxHeight = '0px';
-
-        var ms = (typeof minMs === 'number' && isFinite(minMs)) ? Math.max(0, Math.round(minMs)) : 400;
-        videoEl.__localweb_uncollapse_timer__ = setTimeout(function() {
-          try {
-            videoEl.__localweb_uncollapse_timer__ = null;
-            // Only restore if we're still in "collapsed" mode.
-            if (!videoEl.__localweb_collapsed_for_switch__) return;
-            setVideoCollapsedForSwitch(videoEl, false);
-          } catch (e) {}
-        }, ms);
-        return;
-      }
-
-      videoEl.__localweb_collapsed_for_switch__ = false;
-
-      var prev = videoEl.__localweb_prev_size_style__ || null;
-      if (prev) {
-        videoEl.style.width = prev.width || '';
-        videoEl.style.height = prev.height || '';
-        videoEl.style.maxWidth = prev.maxWidth || '';
-        videoEl.style.maxHeight = prev.maxHeight || '';
-      } else {
-        videoEl.style.width = '';
-        videoEl.style.height = '';
-        videoEl.style.maxWidth = '';
-        videoEl.style.maxHeight = '';
-      }
-    } catch (e) {}
-  }
-
   function setVideoAudioSuppressed(videoEl, on) {
     try {
       if (!videoEl) return;
@@ -276,8 +214,6 @@
       setVideoLoading(videoEl, true, reason || 'transition');
       // Hide immediately so native glyph can't flash.
       setVideoHiddenForSwitch(videoEl, true);
-      // Extra: collapse size for at least 400ms to avoid early glyph paint.
-      setVideoCollapsedForSwitch(videoEl, true, 400);
 
       // Failsafe: if we never observe a clean "playing"/timeupdate (WebView quirks),
       // still end the transition after a short window.
@@ -343,15 +279,12 @@
           try {
             videoEl.__localweb_hide_overlay_timer__ = null;
             hideLoadingOverlay();
-            // Restore size before unhiding.
-            setVideoCollapsedForSwitch(videoEl, false);
             setVideoHiddenForSwitch(videoEl, false);
           } catch (e) {}
         }, 1500);
       } catch (e) {
         // If timers fail for some reason, do it immediately.
         try { hideLoadingOverlay(); } catch (_e) {}
-        try { setVideoCollapsedForSwitch(videoEl, false); } catch (_e) {}
         try { setVideoHiddenForSwitch(videoEl, false); } catch (_e) {}
       }
 
@@ -531,8 +464,11 @@
   function ensureVideoVisible(videoEl, reason) {
     try {
       if (!videoEl || videoEl.__localweb_forced_overlay__) return;
-      // If we intentionally collapsed the video during a source switch, don't fight it.
-      if (videoEl.__localweb_collapsed_for_switch__) return;
+      // In soft fullscreen, avoid the fixed-position overlay workaround (it can make the
+      // video surface disappear in Android WebView). Fullscreen styling should handle visibility.
+      try {
+        if (window.__localweb_soft_fullscreen_active__ || videoEl.__localweb_soft_fullscreen_active__) return;
+      } catch (e) {}
       ensureBaseHeights();
       ensureFixStyleInstalled();
       scheduleVh('ensureVideoVisible');
@@ -1106,7 +1042,7 @@
       softFullscreenSetOverflow(true);
 
       if (root && root.style) {
-        root.style.position = 'fixed';
+        root.style.position = 'absolute';
         root.style.left = '0';
         root.style.top = '0';
         root.style.right = '0';
