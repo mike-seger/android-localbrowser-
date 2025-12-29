@@ -1,10 +1,16 @@
 package com.net128.android.localwebbrowser
 
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
+import android.os.SystemClock
 import android.provider.DocumentsContract
+import android.provider.DocumentsContract.Document
 import android.util.Log
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
@@ -18,6 +24,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -63,6 +70,32 @@ import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.net.URLConnection
 
+private const val PREFS_NAME = "localwebbrowser"
+private const val PREF_LAST_FOLDER_URI = "lastFolderUri"
+private const val PREF_LAST_FILE_URI = "lastFileUri"
+
+private fun prefs(context: Context): SharedPreferences =
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+private class OpenDocumentTreeReadOnly : ActivityResultContract<Uri?, Uri?>() {
+    override fun createIntent(context: Context, input: Uri?): Intent {
+        return Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
+            // Optional: start browsing at the provided tree/document.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && input != null) {
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, input)
+            }
+        }
+    }
+
+    override fun parseResult(resultCode: Int, intent: Intent?): Uri? {
+        if (resultCode != Activity.RESULT_OK) return null
+        return intent?.data
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,9 +112,15 @@ class MainActivity : ComponentActivity() {
 @PreviewScreenSizes
 @Composable
 fun LocalWebbrowserApp() {
+    val context = LocalContext.current
+
     var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
-    var selectedFileUri by rememberSaveable { mutableStateOf<String?>(null) }
-    var selectedFolderUri by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val savedLastFile = remember { prefs(context).getString(PREF_LAST_FILE_URI, null) }
+    val savedLastFolder = remember { prefs(context).getString(PREF_LAST_FOLDER_URI, null) }
+
+    var selectedFileUri by rememberSaveable { mutableStateOf(savedLastFile) }
+    var selectedFolderUri by rememberSaveable { mutableStateOf(savedLastFolder) }
 
     NavigationSuiteScaffold(
         navigationSuiteItems = {
@@ -107,6 +146,12 @@ fun LocalWebbrowserApp() {
                     onFileSelected = { fileUri, folderUri ->
                         selectedFileUri = fileUri
                         selectedFolderUri = folderUri
+
+                        prefs(context).edit()
+                            .putString(PREF_LAST_FILE_URI, fileUri)
+                            .putString(PREF_LAST_FOLDER_URI, folderUri)
+                            .apply()
+
                         currentDestination = AppDestinations.WEBVIEW
                     }
                 )
@@ -147,24 +192,43 @@ fun BrowserScreen(
     onFileSelected: (fileUri: String, folderUri: String?) -> Unit,
 ) {
     val context = LocalContext.current
-    var currentUri by rememberSaveable { mutableStateOf<String?>(null) }
+    val savedLastFolder = remember { prefs(context).getString(PREF_LAST_FOLDER_URI, null) }
+    var currentUri by rememberSaveable { mutableStateOf(savedLastFolder) }
     var backStack by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
 
     val directoryPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
+        contract = OpenDocumentTreeReadOnly()
     ) { uri ->
         if (uri != null) {
-            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            context.contentResolver.takePersistableUriPermission(uri, flags)
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
             currentUri = uri.toString()
             backStack = emptyList()
+
+            prefs(context).edit().putString(PREF_LAST_FOLDER_URI, currentUri).apply()
         }
     }
 
-    val currentDir = currentUri?.let { DocumentFile.fromTreeUri(context, it.toUri()) }
+    val currentDir = currentUri?.let { uriString ->
+        try {
+            DocumentFile.fromTreeUri(context, uriString.toUri())
+        } catch (_: SecurityException) {
+            prefs(context).edit().remove(PREF_LAST_FOLDER_URI).apply()
+            currentUri = null
+            null
+        }
+    }
+    fun isHtmlFile(file: DocumentFile): Boolean {
+        val name = file.name ?: return false
+        val lower = name.lowercase()
+        return lower.endsWith(".html") || lower.endsWith(".htm")
+    }
+
     val children = currentDir
         ?.listFiles()
+        ?.filter { it.isDirectory || isHtmlFile(it) }
         ?.sortedWith(
             compareBy<DocumentFile> { !it.isDirectory }
                 .thenBy { it.name?.lowercase() ?: "" }
@@ -241,13 +305,59 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
     val context = LocalContext.current
     val logTag = "LocalWebView"
     var lastLoadedKey by remember { mutableStateOf<String?>(null) }
+    var interceptedCount by remember { mutableStateOf(0) }
+    var interceptedBytes by remember { mutableStateOf(0L) }
+    var lastStatsAtMs by remember { mutableStateOf(SystemClock.elapsedRealtime()) }
+    var loggedFolderContext by remember(folderUri, uri) { mutableStateOf(false) }
     val selectedFile = remember(uri) {
         uri?.let { DocumentFile.fromSingleUri(context, Uri.parse(it)) }
     }
 
-    val selectedFolder = remember(folderUri) {
-        folderUri?.let { DocumentFile.fromTreeUri(context, Uri.parse(it)) }
+    data class FolderContext(
+        val treeUri: Uri,
+        val baseDocId: String,
+    )
+
+    val folderContext = remember(uri, folderUri) {
+        // Prefer an explicit folder URI from the browser. If it's missing (e.g., restored state),
+        // derive the folder from the selected HTML file's document id.
+        val baseUri = when {
+            !folderUri.isNullOrBlank() -> Uri.parse(folderUri)
+            !uri.isNullOrBlank() -> Uri.parse(uri)
+            else -> return@remember null
+        }
+
+        try {
+            val authority = baseUri.authority ?: return@remember null
+            val treeId = DocumentsContract.getTreeDocumentId(baseUri)
+            val canonicalTreeUri = DocumentsContract.buildTreeDocumentUri(authority, treeId)
+
+            val baseDocId = if (!folderUri.isNullOrBlank()) {
+                // Folder URI may be the tree root or a document-in-tree URI.
+                if (DocumentsContract.isDocumentUri(context, baseUri)) {
+                    DocumentsContract.getDocumentId(baseUri)
+                } else {
+                    treeId
+                }
+            } else {
+                // No folderUri: use parent folder of the HTML file.
+                if (!DocumentsContract.isDocumentUri(context, baseUri)) return@remember null
+                val fileDocId = DocumentsContract.getDocumentId(baseUri)
+                // Document ids are typically like "volumeId:path/to/file".
+                fileDocId.substringBeforeLast('/', missingDelimiterValue = fileDocId)
+            }
+
+            FolderContext(treeUri = canonicalTreeUri, baseDocId = baseDocId)
+        } catch (_: Exception) {
+            null
+        }
     }
+
+    data class ResolvedDoc(
+        val uri: Uri,
+        val isDirectory: Boolean,
+        val sizeBytes: Long?,
+    )
 
     // Resolve MIME type for local resources so CSS/JS/fonts load correctly.
     fun guessMimeTypeFromPath(pathOrName: String): String {
@@ -289,17 +399,127 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
         }
     }
 
-    fun resolveInFolder(folder: DocumentFile, relativePath: String): DocumentFile? {
+    // SAF resolution can get extremely slow with large folders (e.g., thousands of thumbnails)
+    // when using DocumentFile.findFile(). Use DocumentsContract name lookups instead.
+    val dirDocIdCache = remember(folderUri) { mutableMapOf<String, String>() }
+
+    fun queryDocumentByDocId(treeUri: Uri, docId: String): ResolvedDoc? {
+        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+        val projection = arrayOf(
+            Document.COLUMN_DOCUMENT_ID,
+            Document.COLUMN_MIME_TYPE,
+            Document.COLUMN_SIZE,
+        )
+        return try {
+            context.contentResolver.query(docUri, projection, null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) return null
+                val actualDocId = cursor.getString(0)
+                val mime = cursor.getString(1)
+                val isDir = mime == Document.MIME_TYPE_DIR
+                val size = if (!cursor.isNull(2)) cursor.getLong(2) else null
+                ResolvedDoc(
+                    uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, actualDocId),
+                    isDirectory = isDir,
+                    sizeBytes = size,
+                )
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun queryChildByDisplayName(
+        treeUri: Uri,
+        parentDocId: String,
+        displayName: String,
+    ): ResolvedDoc? {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val projection = arrayOf(
+            Document.COLUMN_DOCUMENT_ID,
+            Document.COLUMN_DISPLAY_NAME,
+            Document.COLUMN_MIME_TYPE,
+            Document.COLUMN_SIZE,
+        )
+
+        fun rowToResolved(cursor: android.database.Cursor): ResolvedDoc {
+            val docId = cursor.getString(0)
+            val mime = cursor.getString(2)
+            val isDir = mime == Document.MIME_TYPE_DIR
+            val size = if (!cursor.isNull(3)) cursor.getLong(3) else null
+            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+            return ResolvedDoc(uri = docUri, isDirectory = isDir, sizeBytes = size)
+        }
+
+        // Some providers support selection; if not, fall back to scanning.
+        try {
+            context.contentResolver.query(
+                childrenUri,
+                projection,
+                "${Document.COLUMN_DISPLAY_NAME}=?",
+                arrayOf(displayName),
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) return rowToResolved(cursor)
+            }
+        } catch (_: Exception) {
+            // ignore and fall back
+        }
+
+        return try {
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val name = cursor.getString(1)
+                    if (name == displayName) return rowToResolved(cursor)
+                }
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun resolveInFolder(relativePath: String): ResolvedDoc? {
+        val fc = folderContext ?: return null
+        val treeUri = fc.treeUri
         val cleanPath = relativePath.trimStart('/').substringBefore('?').substringBefore('#')
         if (cleanPath.isBlank()) return null
-        var current: DocumentFile = folder
-        val parts = cleanPath.split('/').filter { it.isNotBlank() }.map { Uri.decode(it) }
-        for ((index, part) in parts.withIndex()) {
-            val next = current.findFile(part) ?: return null
-            if (index < parts.lastIndex && !next.isDirectory) return null
-            current = next
+
+        // Start at the selected folder itself (may be tree root or a sub-folder).
+        val rootDocId = dirDocIdCache.getOrPut("") { fc.baseDocId }
+
+        // Fast path for providers with path-like document IDs (notably ExternalStorageProvider):
+        // build docId by appending the relative path to the base folder docId.
+        val directDocId = when {
+            cleanPath.isBlank() -> rootDocId
+            rootDocId.endsWith("/") -> rootDocId + cleanPath
+            else -> "$rootDocId/$cleanPath"
         }
-        return current
+        queryDocumentByDocId(treeUri, directDocId)?.let { return it }
+
+        val parts = cleanPath.split('/').filter { it.isNotBlank() }.map { Uri.decode(it) }
+        var parentDocId = rootDocId
+        var prefix = ""
+
+        // Walk directories (all but last segment)
+        for (index in 0 until (parts.size - 1)) {
+            val name = parts[index]
+            prefix = if (prefix.isEmpty()) name else "$prefix/$name"
+            val cachedDocId = dirDocIdCache[prefix]
+            if (cachedDocId != null) {
+                parentDocId = cachedDocId
+                continue
+            }
+
+            val child = queryChildByDisplayName(treeUri, parentDocId, name) ?: return null
+            if (!child.isDirectory) return null
+            val childDocId = DocumentsContract.getDocumentId(child.uri)
+            dirDocIdCache[prefix] = childDocId
+            parentDocId = childDocId
+        }
+
+        // Resolve final segment (child-by-name traversal fallback)
+        val leafName = parts.last()
+        return queryChildByDisplayName(treeUri, parentDocId, leafName)
     }
 
     val localHost = "local.web"
@@ -333,20 +553,51 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
         // Serve subresources from the selected folder via a stable https:// origin.
         val url = request.url
         if (url.scheme != "https" || url.host != localHost) return null
-        val folder = selectedFolder
+        val startMs = SystemClock.elapsedRealtime()
         val relPath = url.encodedPath ?: return notFound(url)
-        if (folder == null) return notFound(url)
-
-        val file = resolveInFolder(folder, relPath) ?: run {
-            Log.w(logTag, "Missing local resource: $url")
+        val fc = folderContext
+        if (fc == null) {
+            if (!loggedFolderContext) {
+                Log.e(logTag, "folderContext=null (folderUri=$folderUri uri=$uri)")
+                loggedFolderContext = true
+            }
             return notFound(url)
         }
-        if (file.isDirectory) return notFound(url)
+        if (!loggedFolderContext) {
+            Log.d(logTag, "folderContext treeUri=${fc.treeUri} baseDocId=${fc.baseDocId}")
+            loggedFolderContext = true
+        }
+
+        val resolveStartMs = SystemClock.elapsedRealtime()
+        val resolved = resolveInFolder(relPath) ?: run {
+            Log.e(logTag, "Missing local resource: $url (baseDocId=${fc.baseDocId})")
+            return notFound(url)
+        }
+        val resolveMs = SystemClock.elapsedRealtime() - resolveStartMs
+        if (resolved.isDirectory) return notFound(url)
 
         return try {
             val mime = guessMimeTypeFromPath(relPath)
-            val stream = context.contentResolver.openInputStream(file.uri)
+            val streamStartMs = SystemClock.elapsedRealtime()
+            val stream = context.contentResolver.openInputStream(resolved.uri)
                 ?: return serverError(url, "Failed to open stream")
+            val openMs = SystemClock.elapsedRealtime() - streamStartMs
+
+            // Periodic stats (kept lightweight).
+            interceptedCount += 1
+            val size = resolved.sizeBytes ?: -1L
+            if (size > 0) interceptedBytes += size
+            val nowMs = SystemClock.elapsedRealtime()
+            if (nowMs - lastStatsAtMs > 2000) {
+                Log.d(logTag, "local served: count=$interceptedCount bytes=$interceptedBytes")
+                lastStatsAtMs = nowMs
+            }
+
+            val totalMs = SystemClock.elapsedRealtime() - startMs
+            if (totalMs >= 25 || openMs >= 25) {
+                Log.w(logTag, "slow local: ${totalMs}ms (resolve=${resolveMs}ms open=${openMs}ms) $url")
+            }
+
             WebResourceResponse(mime, encodingForMime(mime), 200, "OK", emptyMap(), stream)
         } catch (e: Exception) {
             serverError(url, "Exception while serving resource: ${e.message}")
@@ -445,9 +696,14 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
                     val loadKey = "${uri}@@${folderUri ?: ""}"
                     if (lastLoadedKey != loadKey) {
                         lastLoadedKey = loadKey
+                        val t0 = SystemClock.elapsedRealtime()
                         val html = readTextFromUri(fileUri)
+                        val readMs = SystemClock.elapsedRealtime() - t0
                         if (html != null) {
-                            Log.d(logTag, "loadDataWithBaseURL base=$localBaseUrl htmlUri=$fileUri")
+                            Log.d(
+                                logTag,
+                                "loadDataWithBaseURL base=$localBaseUrl htmlUri=$fileUri htmlBytes=${html.toByteArray(StandardCharsets.UTF_8).size} readMs=${readMs}"
+                            )
                             webView.loadDataWithBaseURL(
                                 localBaseUrl,
                                 html,
