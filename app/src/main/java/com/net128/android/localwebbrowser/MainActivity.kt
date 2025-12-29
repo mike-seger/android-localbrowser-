@@ -5,6 +5,9 @@ import android.net.Uri
 import android.os.Bundle
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.MimeTypeMap
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -49,6 +52,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.documentfile.provider.DocumentFile
 import androidx.core.net.toUri
 import com.net128.android.localwebbrowser.ui.theme.LocalWebbrowserTheme
+import java.io.InputStream
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -227,6 +231,33 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?) {
         uri?.let { DocumentFile.fromSingleUri(context, Uri.parse(it)) }
     }
 
+    // Resolve MIME type for SAF resources so CSS/JS/fonts load correctly.
+    fun guessMimeType(target: Uri): String {
+        val ext = target.lastPathSegment?.substringAfterLast('.', missingDelimiterValue = "")?.lowercase()
+        return when (ext) {
+            "css" -> "text/css"
+            "js", "mjs" -> "text/javascript"
+            "json" -> "application/json"
+            "html", "htm" -> "text/html"
+            "svg" -> "image/svg+xml"
+            "woff" -> "font/woff"
+            "woff2" -> "font/woff2"
+            "ttf" -> "font/ttf"
+            else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext ?: "") ?: "application/octet-stream"
+        }
+    }
+
+    fun interceptContentRequest(request: WebResourceRequest): WebResourceResponse? {
+        if (request.url.scheme != "content") return null
+        return try {
+            val mime = guessMimeType(request.url)
+            val stream: InputStream? = context.contentResolver.openInputStream(request.url)
+            if (stream != null) WebResourceResponse(mime, "utf-8", stream) else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -238,9 +269,7 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?) {
             style = MaterialTheme.typography.titleMedium
         )
         if (uri != null) {
-            SelectionContainer {
-                Text(uri, style = MaterialTheme.typography.bodySmall)
-            }
+            SelectionContainer { Text(uri, style = MaterialTheme.typography.bodySmall) }
         }
 
         if (uri != null) {
@@ -250,7 +279,13 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?) {
                     WebView(context).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        webViewClient = WebViewClient()
+                        settings.allowContentAccess = true
+                        settings.allowFileAccess = true
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest): WebResourceResponse? {
+                                return interceptContentRequest(request) ?: super.shouldInterceptRequest(view, request)
+                            }
+                        }
                     }
                 },
                 update = { webView ->
