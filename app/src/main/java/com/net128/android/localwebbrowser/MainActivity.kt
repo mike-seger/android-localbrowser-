@@ -53,6 +53,7 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.core.net.toUri
 import com.net128.android.localwebbrowser.ui.theme.LocalWebbrowserTheme
 import java.io.InputStream
+import java.net.URLConnection
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -233,7 +234,10 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?) {
 
     // Resolve MIME type for SAF resources so CSS/JS/fonts load correctly.
     fun guessMimeType(target: Uri): String {
-        val ext = target.lastPathSegment?.substringAfterLast('.', missingDelimiterValue = "")?.lowercase()
+        val lastSegment = target.lastPathSegment ?: ""
+        // Strip query/fragment before extension lookup.
+        val cleanSegment = lastSegment.substringBefore('?').substringBefore('#')
+        val ext = cleanSegment.substringAfterLast('.', missingDelimiterValue = "").lowercase()
         return when (ext) {
             "css" -> "text/css"
             "js", "mjs" -> "text/javascript"
@@ -243,7 +247,7 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?) {
             "woff" -> "font/woff"
             "woff2" -> "font/woff2"
             "ttf" -> "font/ttf"
-            else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext ?: "") ?: "application/octet-stream"
+            else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: URLConnection.guessContentTypeFromName(cleanSegment) ?: "application/octet-stream"
         }
     }
 
@@ -281,6 +285,8 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?) {
                         settings.domStorageEnabled = true
                         settings.allowContentAccess = true
                         settings.allowFileAccess = true
+                        settings.allowUniversalAccessFromFileURLs = true
+                        settings.allowFileAccessFromFileURLs = true
                         webViewClient = object : WebViewClient() {
                             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest): WebResourceResponse? {
                                 return interceptContentRequest(request) ?: super.shouldInterceptRequest(view, request)
