@@ -2,6 +2,7 @@ package com.net128.android.localwebbrowser
 
 import android.app.Activity
 import android.content.pm.ApplicationInfo
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
@@ -710,6 +711,16 @@ fun WebViewScreen(
                             settings.mediaPlaybackRequiresUserGesture = false
 
                             webChromeClient = object : WebChromeClient() {
+                                override fun getDefaultVideoPoster(): Bitmap? {
+                                    // Prevent WebView from using its default "video poster" artwork.
+                                    // Returning a transparent 1x1 bitmap avoids showing the built-in glyph.
+                                    return try {
+                                        Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+                                    } catch (_: Exception) {
+                                        null
+                                    }
+                                }
+
                                 override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
                                     val src = consoleMessage.sourceId().substringAfterLast('/')
                                     val msg = consoleMessage.message() ?: ""
@@ -739,21 +750,22 @@ fun WebViewScreen(
                                 override fun onShowCustomView(view: View?, callback: WebChromeClient.CustomViewCallback?) {
                                     Log.d(logTag, "webChromeClient.onShowCustomView: view=${view?.javaClass?.name}")
 
-                                    // Prefer a CSS-based "soft fullscreen" to avoid interrupting A/V by swapping
-                                    // into WebView's native fullscreen custom view.
-                                    runCatching { callback?.onCustomViewHidden() }
-                                    customView = null
-                                    customViewCallback = null
-                                    pageFullscreenRequested = true
+                                    // Use native WebView fullscreen custom view.
+                                    // The CSS-based soft fullscreen path has proven unreliable (video can vanish).
+                                    if (view == null || callback == null) {
+                                        super.onShowCustomView(view, callback)
+                                        return
+                                    }
+
+                                    // Detach from any previous parent, then keep it as our active custom view.
+                                    (view.parent as? ViewGroup)?.removeView(view)
+                                    customView = view
+                                    customViewCallback = callback
+                                    pageFullscreenRequested = false
+
                                     // Entering fullscreen is a user action; show the exit affordance.
                                     showExitFullscreen = true
                                     setSystemBarsHidden(true)
-                                    runCatching {
-                                        webViewRef?.evaluateJavascript(
-                                            "try{window.__localweb_soft_fullscreen_enter__&&window.__localweb_soft_fullscreen_enter__();}catch(e){}",
-                                            null
-                                        )
-                                    }
                                 }
 
                                 override fun onHideCustomView() {
