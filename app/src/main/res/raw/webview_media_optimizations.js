@@ -173,166 +173,98 @@
     } catch (e) {}
   }
 
+  // Some WebView builds still flash a native play glyph even when opacity/visibility are hidden.
+  // As an extra mitigation, temporarily collapse the video element's rendered size to 0 for a short
+  // period right after we detect a source switch.
+  function setVideoCollapsedForSwitch(videoEl, on, minMs) {
+    try {
+      if (!videoEl || !videoEl.style) return;
+
+      // Ensure timers don't pile up.
+      try {
+        if (videoEl.__localweb_uncollapse_timer__) {
+          clearTimeout(videoEl.__localweb_uncollapse_timer__);
+          videoEl.__localweb_uncollapse_timer__ = null;
+        }
+      } catch (e) {}
+
+      if (on) {
+        if (!videoEl.__localweb_prev_size_style__) {
+          videoEl.__localweb_prev_size_style__ = {
+            width: videoEl.style.width,
+            height: videoEl.style.height,
+            maxWidth: videoEl.style.maxWidth,
+            maxHeight: videoEl.style.maxHeight,
+          };
+        }
+
+        videoEl.__localweb_collapsed_for_switch__ = true;
+
+        // Collapse hard to zero (user requested). Keep hidden styles separate.
+        videoEl.style.width = '0px';
+        videoEl.style.height = '0px';
+        videoEl.style.maxWidth = '0px';
+        videoEl.style.maxHeight = '0px';
+
+        var ms = (typeof minMs === 'number' && isFinite(minMs)) ? Math.max(0, Math.round(minMs)) : 400;
+        videoEl.__localweb_uncollapse_timer__ = setTimeout(function() {
+          try {
+            videoEl.__localweb_uncollapse_timer__ = null;
+            // Only restore if we're still in "collapsed" mode.
+            if (!videoEl.__localweb_collapsed_for_switch__) return;
+            setVideoCollapsedForSwitch(videoEl, false);
+          } catch (e) {}
+        }, ms);
+        return;
+      }
+
+      videoEl.__localweb_collapsed_for_switch__ = false;
+
+      var prev = videoEl.__localweb_prev_size_style__ || null;
+      if (prev) {
+        videoEl.style.width = prev.width || '';
+        videoEl.style.height = prev.height || '';
+        videoEl.style.maxWidth = prev.maxWidth || '';
+        videoEl.style.maxHeight = prev.maxHeight || '';
+      } else {
+        videoEl.style.width = '';
+        videoEl.style.height = '';
+        videoEl.style.maxWidth = '';
+        videoEl.style.maxHeight = '';
+      }
+    } catch (e) {}
+  }
+
   function setVideoAudioSuppressed(videoEl, on) {
     try {
       if (!videoEl) return;
-      if (on) {
-        try {
-          if (videoEl.__localweb_fade_timer__) {
-            clearInterval(videoEl.__localweb_fade_timer__);
-            videoEl.__localweb_fade_timer__ = null;
-          }
-        } catch (e) {}
 
-        try {
-          if (videoEl.__localweb_restore_audio_timer__) {
-            clearTimeout(videoEl.__localweb_restore_audio_timer__);
-            videoEl.__localweb_restore_audio_timer__ = null;
-          }
-        } catch (e) {}
-
-        if (videoEl.__localweb_prev_muted__ === undefined) {
-          try { videoEl.__localweb_prev_muted__ = !!videoEl.muted; } catch (e) {}
+      // User request: do not change audio/volume during transitions.
+      // We still keep the visual transition (overlay/hide/collapse) logic.
+      try {
+        if (videoEl.__localweb_fade_timer__) {
+          clearInterval(videoEl.__localweb_fade_timer__);
+          videoEl.__localweb_fade_timer__ = null;
         }
+      } catch (e) {}
 
-        // Track a stable desired volume so rapid transitions don't ratchet volume down.
-        // (During fades, current volume may be temporarily < desired.)
-        try {
-          var currentV = (typeof videoEl.volume === 'number') ? videoEl.volume : 1;
-          if (videoEl.__localweb_desired_volume__ === undefined || !isFinite(videoEl.__localweb_desired_volume__)) {
-            videoEl.__localweb_desired_volume__ = currentV;
-          } else {
-            // Only ever increase desired volume based on observed values.
-            videoEl.__localweb_desired_volume__ = Math.max(videoEl.__localweb_desired_volume__, currentV);
-          }
-        } catch (e) {}
-
-        if (videoEl.__localweb_prev_volume__ === undefined) {
-          try {
-            // Baseline restore volume comes from desired volume if available.
-            var v = (videoEl.__localweb_desired_volume__ !== undefined) ? Number(videoEl.__localweb_desired_volume__) : null;
-            if (!(v !== null && isFinite(v))) {
-              v = (typeof videoEl.volume === 'number') ? videoEl.volume : 1;
-            }
-            videoEl.__localweb_prev_volume__ = v;
-          } catch (e) {}
+      try {
+        if (videoEl.__localweb_restore_audio_timer__) {
+          clearTimeout(videoEl.__localweb_restore_audio_timer__);
+          videoEl.__localweb_restore_audio_timer__ = null;
         }
+      } catch (e) {}
 
-        // Avoid toggling muted on/off (can pop on some WebView builds). Instead, do a fast fade-out to 0.
-        try {
-          if (typeof videoEl.volume === 'number') {
-            var startV = 1;
-            try { startV = Number(videoEl.volume); } catch (e) {}
-            if (!isFinite(startV)) startV = 1;
-            startV = Math.max(0, Math.min(1, startV));
-
-            var stepsOut = 5;
-            var outMs = 60;
-            var stepOutMs = Math.max(10, Math.round(outMs / stepsOut));
-            var iOut = 0;
-            videoEl.__localweb_fade_timer__ = setInterval(function() {
-              try {
-                iOut++;
-                var vOut = startV * (1 - (iOut / stepsOut));
-                if (vOut < 0.001) vOut = 0;
-                videoEl.volume = vOut;
-                if (iOut >= stepsOut) {
-                  clearInterval(videoEl.__localweb_fade_timer__);
-                  videoEl.__localweb_fade_timer__ = null;
-                  videoEl.volume = 0;
-                }
-              } catch (e) {
-                try {
-                  clearInterval(videoEl.__localweb_fade_timer__);
-                  videoEl.__localweb_fade_timer__ = null;
-                } catch (e2) {}
-              }
-            }, stepOutMs);
-          }
-        } catch (e) {}
-
-        videoEl.__localweb_audio_suppressed__ = true;
-      } else {
-        var prevMuted = (videoEl.__localweb_prev_muted__ !== undefined) ? !!videoEl.__localweb_prev_muted__ : null;
-        var prevVolume = (videoEl.__localweb_prev_volume__ !== undefined) ? Number(videoEl.__localweb_prev_volume__) : null;
-
-        // If the user intended it muted, keep it muted and stop here.
-        if (prevMuted === true) {
-          try { videoEl.muted = true; } catch (e) {}
-          try { if (typeof videoEl.volume === 'number') videoEl.volume = 0; } catch (e) {}
-          videoEl.__localweb_prev_muted__ = undefined;
-          videoEl.__localweb_prev_volume__ = undefined;
-          videoEl.__localweb_audio_suppressed__ = false;
-          return;
-        }
-
-        // Keep muted=false (don’t toggle) and fade volume in to avoid pops.
-        try { videoEl.muted = false; } catch (e) {}
-
-        // Fade volume in over ~200ms to avoid scratchy remnants/pops.
-        if (prevVolume !== null && isFinite(prevVolume)) {
-          try {
-            if (typeof videoEl.volume === 'number') {
-              videoEl.volume = 0;
-              var target = Math.max(0, Math.min(1, prevVolume));
-              // Keep desired volume in sync with restored value.
-              try { videoEl.__localweb_desired_volume__ = target; } catch (e) {}
-              var steps = 10;
-              var stepMs = 200 / steps;
-              var i = 0;
-              try {
-                if (videoEl.__localweb_fade_timer__) {
-                  clearInterval(videoEl.__localweb_fade_timer__);
-                  videoEl.__localweb_fade_timer__ = null;
-                }
-              } catch (e) {}
-              videoEl.__localweb_fade_timer__ = setInterval(function() {
-                try {
-                  i++;
-                  var v = target * (i / steps);
-                  videoEl.volume = v;
-                  if (i >= steps) {
-                    clearInterval(videoEl.__localweb_fade_timer__);
-                    videoEl.__localweb_fade_timer__ = null;
-                    videoEl.volume = target;
-                  }
-                } catch (e) {
-                  try {
-                    clearInterval(videoEl.__localweb_fade_timer__);
-                    videoEl.__localweb_fade_timer__ = null;
-                  } catch (e2) {}
-                }
-              }, stepMs);
-            }
-          } catch (e) {}
-          videoEl.__localweb_prev_volume__ = undefined;
-        }
-
-        videoEl.__localweb_prev_muted__ = undefined;
-        videoEl.__localweb_audio_suppressed__ = false;
-      }
+      videoEl.__localweb_prev_muted__ = undefined;
+      videoEl.__localweb_prev_volume__ = undefined;
+      videoEl.__localweb_audio_suppressed__ = false;
     } catch (e) {}
   }
 
   function scheduleAudioRestore(videoEl, reason) {
     try {
+      // Intentionally disabled: we no longer suppress/restore audio during transitions.
       if (!videoEl) return;
-      if (videoEl.__localweb_restore_audio_timer__) {
-        clearTimeout(videoEl.__localweb_restore_audio_timer__);
-        videoEl.__localweb_restore_audio_timer__ = null;
-      }
-
-      // Wait a moment after "playing/canplay"; WebView can still pop if we restore immediately.
-      videoEl.__localweb_restore_audio_timer__ = setTimeout(function() {
-        try {
-          videoEl.__localweb_restore_audio_timer__ = null;
-          if (videoEl.classList && videoEl.classList.contains('__localweb_loading')) return;
-          if (!videoEl.__localweb_audio_suppressed__) return;
-          setVideoAudioSuppressed(videoEl, false);
-        } catch (e) {}
-      }, 120);
-
-      try { console.log('[media-debug] schedule audio restore:', reason || ''); } catch (e) {}
     } catch (e) {}
   }
 
@@ -342,9 +274,88 @@
       if (videoEl.classList.contains('__localweb_loading')) return;
       ensureFixStyleInstalled();
       setVideoLoading(videoEl, true, reason || 'transition');
-      setVideoAudioSuppressed(videoEl, true);
       // Hide immediately so native glyph can't flash.
       setVideoHiddenForSwitch(videoEl, true);
+      // Extra: collapse size for at least 400ms to avoid early glyph paint.
+      setVideoCollapsedForSwitch(videoEl, true, 400);
+
+      // Failsafe: if we never observe a clean "playing"/timeupdate (WebView quirks),
+      // still end the transition after a short window.
+      try {
+        if (videoEl.__localweb_transition_failsafe_timer__) {
+          clearTimeout(videoEl.__localweb_transition_failsafe_timer__);
+          videoEl.__localweb_transition_failsafe_timer__ = null;
+        }
+      } catch (e) {}
+      try {
+        videoEl.__localweb_transition_failsafe_timer__ = setTimeout(function() {
+          try {
+            videoEl.__localweb_transition_failsafe_timer__ = null;
+            // Only force-end if we still think we're loading.
+            if (videoEl.classList && videoEl.classList.contains('__localweb_loading')) {
+              endVideoTransition(videoEl, 'failsafe');
+            }
+          } catch (e) {}
+        }, 1600);
+      } catch (e) {}
+    } catch (e) {}
+  }
+
+  function endVideoTransition(videoEl, reason) {
+    try {
+      if (!videoEl || !videoEl.classList) return;
+      if (!videoEl.classList.contains('__localweb_loading')) return;
+
+      // Don't end too early (this is where the native play glyph tends to flash).
+      // Require playback to have actually started OR time to be advancing.
+      var ok = false;
+      try {
+        ok = (!!videoEl && !videoEl.paused && !videoEl.ended);
+      } catch (e) {}
+      if (!ok) {
+        try {
+          var t = (typeof videoEl.currentTime === 'number') ? videoEl.currentTime : 0;
+          var lastT = (typeof videoEl.__localweb_last_time__ === 'number') ? videoEl.__localweb_last_time__ : null;
+          if (lastT !== null && isFinite(lastT) && isFinite(t) && (t - lastT) > 0.02) ok = true;
+        } catch (e) {}
+      }
+
+      // If we can't prove it's running, don't end yet.
+      if (!ok && reason !== 'failsafe') return;
+
+      try {
+        if (videoEl.classList.contains('__localweb_loading')) {
+          videoEl.classList.remove('__localweb_loading');
+          console.log('[media-debug] ui:video-loading=0 reason=' + (reason || ''));
+        }
+      } catch (e) {}
+
+      // Keep the spinner for a tiny beat after playing starts (WebView can flash the glyph
+      // between ready and first stable frame).
+      try {
+        if (videoEl.__localweb_hide_overlay_timer__) {
+          clearTimeout(videoEl.__localweb_hide_overlay_timer__);
+          videoEl.__localweb_hide_overlay_timer__ = null;
+        }
+      } catch (e) {}
+      try {
+        videoEl.__localweb_hide_overlay_timer__ = setTimeout(function() {
+          try {
+            videoEl.__localweb_hide_overlay_timer__ = null;
+            hideLoadingOverlay();
+            // Restore size before unhiding.
+            setVideoCollapsedForSwitch(videoEl, false);
+            setVideoHiddenForSwitch(videoEl, false);
+          } catch (e) {}
+        }, 1500);
+      } catch (e) {
+        // If timers fail for some reason, do it immediately.
+        try { hideLoadingOverlay(); } catch (_e) {}
+        try { setVideoCollapsedForSwitch(videoEl, false); } catch (_e) {}
+        try { setVideoHiddenForSwitch(videoEl, false); } catch (_e) {}
+      }
+
+      try { console.log('[media-debug] end transition:', reason || ''); } catch (e) {}
     } catch (e) {}
   }
 
@@ -363,6 +374,8 @@
         '  align-items: center;',
         '  justify-content: center;',
         '  z-index: 2147483647;',
+        // Opaque cover to hide WebView's native play glyph even if it draws outside CSS control.
+        '  background: rgba(0,0,0,0.90);',
         '  pointer-events: none;',
         '}',
         '.__localweb_video_loading_overlay.__show { display: flex; }',
@@ -396,15 +409,58 @@
     try {
       var overlay = getLoadingOverlayEl();
       if (!overlay || !videoEl || !videoEl.getBoundingClientRect) return;
+
+      function applyRect(r) {
+        try {
+          var w = Math.max(0, Math.round(r.width || 0));
+          var h = Math.max(0, Math.round(r.height || 0));
+          if (w < 2 || h < 2) return false;
+          overlay.style.left = Math.round(r.left || 0) + 'px';
+          overlay.style.top = Math.round(r.top || 0) + 'px';
+          overlay.style.width = w + 'px';
+          overlay.style.height = h + 'px';
+          overlay.__localweb_last_good_rect__ = { left: r.left || 0, top: r.top || 0, width: w, height: h };
+          return true;
+        } catch (e) {}
+        return false;
+      }
+
+      // 1) Prefer the actual video element rect.
       var r = videoEl.getBoundingClientRect();
-      // Avoid covering the whole page if rect is invalid.
-      var w = Math.max(0, Math.round(r.width || 0));
-      var h = Math.max(0, Math.round(r.height || 0));
-      if (w < 2 || h < 2) return;
-      overlay.style.left = Math.round(r.left) + 'px';
-      overlay.style.top = Math.round(r.top) + 'px';
-      overlay.style.width = w + 'px';
-      overlay.style.height = h + 'px';
+      if (r && applyRect(r)) return;
+
+      // 2) Fallback to the player container (covers where the video should be).
+      try {
+        var pc = document.getElementById('player-container') || document.getElementById('player');
+        if (pc && pc.getBoundingClientRect) {
+          var pr = pc.getBoundingClientRect();
+          if (pr && applyRect(pr)) return;
+        }
+      } catch (e) {}
+
+      // 3) If we had a last-known good rect, keep using it (avoid a brief 0x0 flicker).
+      try {
+        var last = overlay.__localweb_last_good_rect__;
+        if (last && last.width > 1 && last.height > 1) {
+          overlay.style.left = Math.round(last.left) + 'px';
+          overlay.style.top = Math.round(last.top) + 'px';
+          overlay.style.width = Math.round(last.width) + 'px';
+          overlay.style.height = Math.round(last.height) + 'px';
+          return;
+        }
+      } catch (e) {}
+
+      // 4) Last resort: cover the viewport.
+      try {
+        var ww = (typeof window.innerWidth === 'number') ? window.innerWidth : 0;
+        var hh = (typeof window.innerHeight === 'number') ? window.innerHeight : 0;
+        if (ww > 1 && hh > 1) {
+          overlay.style.left = '0px';
+          overlay.style.top = '0px';
+          overlay.style.width = Math.round(ww) + 'px';
+          overlay.style.height = Math.round(hh) + 'px';
+        }
+      } catch (e) {}
     } catch (e) {}
   }
 
@@ -464,13 +520,10 @@
         // Cover the built-in play glyph while switching/loading.
         showLoadingOverlay(videoEl);
       } else {
-        if (videoEl.classList.contains('__localweb_loading')) {
-          videoEl.classList.remove('__localweb_loading');
-          console.log('[media-debug] ui:video-loading=0 reason=' + (reason || ''));
-        }
-        hideLoadingOverlay();
-        // Restore audio once the new media is ready, but with a slight delay to reduce pops.
-        scheduleAudioRestore(videoEl, reason || 'ready');
+        // Don't hide overlay / unhide the video yet. In WebView, "canplay/loadeddata" often
+        // fires before playback actually starts, which causes a brief native overlay glyph.
+        // We'll end the transition on "playing" or timeupdate.
+        try { showLoadingOverlay(videoEl); } catch (e) {}
       }
     } catch (e) {}
   }
@@ -478,6 +531,8 @@
   function ensureVideoVisible(videoEl, reason) {
     try {
       if (!videoEl || videoEl.__localweb_forced_overlay__) return;
+      // If we intentionally collapsed the video during a source switch, don't fight it.
+      if (videoEl.__localweb_collapsed_for_switch__) return;
       ensureBaseHeights();
       ensureFixStyleInstalled();
       scheduleVh('ensureVideoVisible');
@@ -535,9 +590,18 @@
           ensureFixStyleInstalled();
           setVideoLoading(el, true, ev.type);
         }
-        if (ev.type === 'playing' || ev.type === 'canplay' || ev.type === 'canplaythrough' || ev.type === 'seeked' || ev.type === 'loadeddata') {
+        if (ev.type === 'canplay' || ev.type === 'canplaythrough' || ev.type === 'loadeddata') {
+          // Ready-ish, but keep overlay until we're actually running.
           setVideoLoading(el, false, ev.type);
-          setVideoHiddenForSwitch(el, false);
+        }
+        if (ev.type === 'playing') {
+          endVideoTransition(el, 'playing');
+        }
+        if (ev.type === 'timeupdate') {
+          try {
+            el.__localweb_last_time__ = (typeof el.currentTime === 'number') ? el.currentTime : el.__localweb_last_time__;
+          } catch (e) {}
+          endVideoTransition(el, 'timeupdate');
         }
       }
 
@@ -639,7 +703,84 @@
     }
   } catch (e) {}
 
+  // Some apps use property assignment (video.src = ...) which bypasses setAttribute.
+  // Patch common setters + load() to start our transition BEFORE WebView paints native UI.
+  (function patchMediaSrcSetters() {
+    try {
+      if (window.__localweb_patched_media_src__) return;
+      window.__localweb_patched_media_src__ = true;
+
+      function patchSetter(proto, propName, tagHint) {
+        try {
+          if (!proto) return;
+          var desc = Object.getOwnPropertyDescriptor(proto, propName);
+          if (!desc || typeof desc.set !== 'function' || typeof desc.get !== 'function') return;
+          if (desc.set.__localweb_patched__) return;
+
+          var origSet = desc.set;
+          var origGet = desc.get;
+
+          var newSet = function(v) {
+            try {
+              var t = (tagHint || (this && this.tagName ? String(this.tagName).toLowerCase() : ''));
+              if (t === 'video') {
+                beginVideoTransition(this, 'prop:' + propName);
+              } else if (t === 'source') {
+                var vv = this && this.closest ? this.closest('video') : null;
+                if (vv) beginVideoTransition(vv, 'prop:source.' + propName);
+              }
+            } catch (e) {}
+            return origSet.call(this, v);
+          };
+          try { newSet.__localweb_patched__ = true; } catch (e) {}
+
+          Object.defineProperty(proto, propName, {
+            configurable: true,
+            enumerable: desc.enumerable,
+            get: function() { return origGet.call(this); },
+            set: newSet
+          });
+        } catch (e) {}
+      }
+
+      patchSetter(HTMLMediaElement && HTMLMediaElement.prototype, 'src', 'video');
+      patchSetter(HTMLVideoElement && HTMLVideoElement.prototype, 'src', 'video');
+      patchSetter(HTMLVideoElement && HTMLVideoElement.prototype, 'poster', 'video');
+      patchSetter(HTMLSourceElement && HTMLSourceElement.prototype, 'src', 'source');
+
+      try {
+        if (HTMLMediaElement && HTMLMediaElement.prototype && !HTMLMediaElement.prototype.__localweb_patched_load__) {
+          HTMLMediaElement.prototype.__localweb_patched_load__ = true;
+          var __origLoad = HTMLMediaElement.prototype.load;
+          if (typeof __origLoad === 'function') {
+            HTMLMediaElement.prototype.load = function() {
+              try {
+                var t = (this && this.tagName ? String(this.tagName).toLowerCase() : '');
+                if (t === 'video') beginVideoTransition(this, 'load()');
+              } catch (e) {}
+              return __origLoad.apply(this, arguments);
+            };
+          }
+        }
+      } catch (e) {}
+    } catch (e) {}
+  })();
+
   // Observe DOM mutations to catch frameworks that replace <video>/<source> nodes.
+  function ensureInitialVideoVolume(videoEl) {
+    try {
+      if (!videoEl) return;
+      if (videoEl.__localweb_initial_volume_set__) return;
+      videoEl.__localweb_initial_volume_set__ = true;
+
+      // User request: always start videos at volume=1.
+      // Do not touch muted state, and do not do transition-time fades.
+      try {
+        if (typeof videoEl.volume === 'number') videoEl.volume = 1;
+      } catch (e) {}
+    } catch (e) {}
+  }
+
   try {
     var mo = new MutationObserver(function(muts) {
       try {
@@ -665,6 +806,7 @@
               if (!node || node.nodeType !== 1) continue;
               var nt = node.tagName ? String(node.tagName).toLowerCase() : '';
               if (nt === 'video') {
+                ensureInitialVideoVolume(node);
                 beginVideoTransition(node, 'mo:added.video');
               } else if (nt === 'source') {
                 var vvv = node.closest && node.closest('video');
@@ -675,7 +817,10 @@
                   if (node.querySelectorAll) {
                     var vids = node.querySelectorAll('video');
                     if (vids && vids.length) {
-                      for (var k = 0; k < vids.length; k++) beginVideoTransition(vids[k], 'mo:added.subtree');
+                      for (var k = 0; k < vids.length; k++) {
+                        ensureInitialVideoVolume(vids[k]);
+                        beginVideoTransition(vids[k], 'mo:added.subtree');
+                      }
                     }
                   }
                 } catch (e) {}
@@ -693,10 +838,161 @@
     });
   } catch (e) {}
 
+  // Initial pass for any videos already on the page.
+  try {
+    var initialVids = document.querySelectorAll ? document.querySelectorAll('video') : null;
+    if (initialVids && initialVids.length) {
+      for (var iv = 0; iv < initialVids.length; iv++) ensureInitialVideoVolume(initialVids[iv]);
+    }
+  } catch (e) {}
+
   // ---- UI signals for host app (fullscreen + video taps) ----
   function logHostSignal(msg) {
     try { console.log('[media-debug] ui:' + msg); } catch (e) {}
   }
+
+  // ---- Edge prev/next gesture helper (for apps that use large invisible edge hit targets) ----
+  // Some WebView video rendering paths can prevent DOM overlay buttons from receiving pointer events.
+  // This handler detects left/right edge taps by coordinates and programmatically clicks the app's
+  // edge buttons if present.
+  (function installEdgeNavGesture() {
+    try {
+      if (window.__localweb_edge_nav_installed__) return;
+      window.__localweb_edge_nav_installed__ = true;
+
+      function isInteractiveTarget(t) {
+        try {
+          if (!t || !t.closest) return false;
+          return !!t.closest('button, input, select, textarea, a, [role="button"], [contenteditable="true"]');
+        } catch (e) {}
+        return false;
+      }
+
+      function getPointFromEvent(ev) {
+        try {
+          if (!ev) return null;
+          if (ev.touches && ev.touches.length) {
+            return { x: ev.touches[0].clientX, y: ev.touches[0].clientY };
+          }
+          if (typeof ev.clientX === 'number' && typeof ev.clientY === 'number') {
+            return { x: ev.clientX, y: ev.clientY };
+          }
+        } catch (e) {}
+        return null;
+      }
+
+      function clickEdgeButton(which) {
+        try {
+          var id = (which === 'prev') ? 'centerEdgePrevBtn' : 'centerEdgeNextBtn';
+          var btn = document.getElementById(id);
+          if (btn && typeof btn.click === 'function') {
+            btn.click();
+            return true;
+          }
+        } catch (e) {}
+        return false;
+      }
+
+      function onEdgeGesture(ev) {
+        try {
+          var now = Date.now();
+          if (window.__localweb_last_edge_nav_ts__ && (now - window.__localweb_last_edge_nav_ts__) < 350) return;
+
+          var t = (ev && ev.target) ? ev.target : null;
+          if (isInteractiveTarget(t)) return;
+
+          // Only handle when interacting with the player surface.
+          try {
+            var pc = document.getElementById('player-container');
+            if (pc && t && pc.contains && !pc.contains(t) && !window.__localweb_soft_fullscreen_active__) {
+              return;
+            }
+          } catch (e) {}
+
+          var p = getPointFromEvent(ev);
+          if (!p) return;
+          var w = (typeof window.innerWidth === 'number') ? window.innerWidth : 0;
+          var h = (typeof window.innerHeight === 'number') ? window.innerHeight : 0;
+          if (!w || !h) return;
+
+          var size = Math.min(w * 0.30, h * 0.30);
+          var cy = h / 2;
+          var y0 = cy - (size / 2);
+          var y1 = cy + (size / 2);
+          if (!(p.y >= y0 && p.y <= y1)) return;
+
+          var did = false;
+          if (p.x <= size) {
+            did = clickEdgeButton('prev');
+          } else if (p.x >= (w - size)) {
+            did = clickEdgeButton('next');
+          }
+          if (!did) return;
+
+          window.__localweb_last_edge_nav_ts__ = now;
+          try {
+            if (ev && ev.cancelable) ev.preventDefault();
+            if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+            if (typeof ev.stopPropagation === 'function') ev.stopPropagation();
+          } catch (e) {}
+        } catch (e) {}
+      }
+
+      document.addEventListener('pointerdown', onEdgeGesture, { capture: true, passive: false });
+      document.addEventListener('touchstart', onEdgeGesture, { capture: true, passive: false });
+    } catch (e) {}
+  })();
+
+  // ---- Watchdog: recover from "video hidden" states after fullscreen toggles/transitions ----
+  function forceShowVideoIfHidden(videoEl, reason) {
+    try {
+      if (!videoEl) return;
+
+      // If our transition code left it hidden, bring it back.
+      try {
+        var cs = window.getComputedStyle ? window.getComputedStyle(videoEl) : null;
+        var op = cs ? Number(cs.opacity) : null;
+        var vis = cs ? String(cs.visibility || '') : '';
+        if (vis === 'hidden' || (op !== null && isFinite(op) && op <= 0.01)) {
+          videoEl.style.visibility = 'visible';
+          videoEl.style.opacity = '1';
+          try {
+            if (videoEl.__localweb_prev_opacity__ !== undefined) videoEl.__localweb_prev_opacity__ = undefined;
+            if (videoEl.__localweb_prev_visibility__ !== undefined) videoEl.__localweb_prev_visibility__ = undefined;
+          } catch (e) {}
+          try { if (videoEl.classList) videoEl.classList.remove('__localweb_loading'); } catch (e) {}
+          try { hideLoadingOverlay(); } catch (e) {}
+          try { console.log('[media-debug] watchdog: forced video visible:', reason || ''); } catch (e) {}
+        }
+      } catch (e) {}
+
+      // If it has collapsed to 0 height, re-apply the known visibility workaround.
+      try {
+        var rect = videoEl.getBoundingClientRect ? videoEl.getBoundingClientRect() : null;
+        var hh = rect ? Math.round(rect.height || 0) : 0;
+        if (hh < 2) {
+          ensureVideoVisible(videoEl, reason || 'watchdog');
+        }
+      } catch (e) {}
+    } catch (e) {}
+  }
+
+  try {
+    if (!window.__localweb_video_watchdog_installed__) {
+      window.__localweb_video_watchdog_installed__ = true;
+      setInterval(function() {
+        try {
+          var v = document.querySelector ? document.querySelector('video') : null;
+          if (!v) return;
+          // Only intervene if playback is active or the element is ready.
+          var active = false;
+          try { active = (!v.paused && !v.ended) || (v.readyState && v.readyState >= 2); } catch (e) {}
+          if (!active) return;
+          forceShowVideoIfHidden(v, 'interval');
+        } catch (e) {}
+      }, 900);
+    }
+  } catch (e) {}
 
   function preemptiveSilenceActiveVideo(reason) {
     try {
@@ -714,40 +1010,10 @@
         }
       } catch (e) {}
 
-      // Capture restore state once.
-      if (v.__localweb_prev_muted__ === undefined) {
-        try { v.__localweb_prev_muted__ = !!v.muted; } catch (e) {}
-      }
-      if (v.__localweb_prev_volume__ === undefined) {
-        try {
-          var vv = (v.__localweb_desired_volume__ !== undefined) ? Number(v.__localweb_desired_volume__) : null;
-          if (!(vv !== null && isFinite(vv))) {
-            vv = (typeof v.volume === 'number') ? v.volume : 1;
-          }
-          v.__localweb_prev_volume__ = vv;
-        } catch (e) {}
-      }
+      // Start the visual transition immediately so WebView's native overlay glyph can't flash.
+      try { beginVideoTransition(v, reason || 'ui'); } catch (e) {}
 
-      // Cancel any pending fades/restores and hard-set volume to 0 BEFORE the page swaps src.
-      try {
-        if (v.__localweb_fade_timer__) {
-          clearInterval(v.__localweb_fade_timer__);
-          v.__localweb_fade_timer__ = null;
-        }
-      } catch (e) {}
-      try {
-        if (v.__localweb_restore_audio_timer__) {
-          clearTimeout(v.__localweb_restore_audio_timer__);
-          v.__localweb_restore_audio_timer__ = null;
-        }
-      } catch (e) {}
-
-      try {
-        if (typeof v.volume === 'number') v.volume = 0;
-      } catch (e) {}
-      v.__localweb_audio_suppressed__ = true;
-
-      try { console.log('[media-debug] preemptive silence:', reason || ''); } catch (e) {}
+      try { console.log('[media-debug] preemptive transition:', reason || ''); } catch (e) {}
     } catch (e) {}
   }
 
@@ -801,18 +1067,35 @@
       try { if (videoEl.classList) videoEl.classList.remove('__localweb_loading'); } catch (e) {}
       try { hideLoadingOverlay(); } catch (e) {}
 
+      // In Android WebView, setting the VIDEO element itself to position:fixed can cause
+      // the video surface to disappear (audio keeps playing). To avoid that, fullscreen
+      // the wrapper (#player-container) and only size the video via width/height.
+      var root = null;
+      try { root = document.getElementById('player-container') || document.getElementById('player'); } catch (e) {}
+      videoEl.__localweb_soft_fullscreen_root__ = root;
+
+      if (root && root.style && root.__localweb_soft_fullscreen_prev_style__ === undefined) {
+        root.__localweb_soft_fullscreen_prev_style__ = {
+          position: root.style.position,
+          left: root.style.left,
+          top: root.style.top,
+          right: root.style.right,
+          bottom: root.style.bottom,
+          width: root.style.width,
+          height: root.style.height,
+          maxWidth: root.style.maxWidth,
+          maxHeight: root.style.maxHeight,
+          zIndex: root.style.zIndex,
+          backgroundColor: root.style.backgroundColor
+        };
+      }
+
       videoEl.__localweb_soft_fullscreen_prev_style__ = {
-        position: videoEl.style.position,
-        left: videoEl.style.left,
-        top: videoEl.style.top,
-        right: videoEl.style.right,
-        bottom: videoEl.style.bottom,
         width: videoEl.style.width,
         height: videoEl.style.height,
         maxWidth: videoEl.style.maxWidth,
         maxHeight: videoEl.style.maxHeight,
         objectFit: videoEl.style.objectFit,
-        zIndex: videoEl.style.zIndex,
         backgroundColor: videoEl.style.backgroundColor,
         display: videoEl.style.display,
         visibility: videoEl.style.visibility,
@@ -822,25 +1105,31 @@
 
       softFullscreenSetOverflow(true);
 
-      videoEl.style.position = 'fixed';
-      videoEl.style.left = '0';
-      videoEl.style.top = '0';
-      videoEl.style.right = '0';
-      videoEl.style.bottom = '0';
-      videoEl.style.width = '100vw';
-      videoEl.style.height = '100vh';
-      videoEl.style.maxWidth = '100vw';
-      videoEl.style.maxHeight = '100vh';
+      if (root && root.style) {
+        root.style.position = 'fixed';
+        root.style.left = '0';
+        root.style.top = '0';
+        root.style.right = '0';
+        root.style.bottom = '0';
+        root.style.width = '100vw';
+        root.style.height = '100vh';
+        root.style.maxWidth = '100vw';
+        root.style.maxHeight = '100vh';
+        root.style.zIndex = '2';
+        root.style.backgroundColor = 'black';
+      }
+
+      // Size the video to fill the wrapper without moving it to fixed positioning.
+      videoEl.style.width = '100%';
+      videoEl.style.height = '100%';
+      videoEl.style.maxWidth = '100%';
+      videoEl.style.maxHeight = '100%';
       videoEl.style.objectFit = 'contain';
-      // Keep below the app's overlay controls (edge prev/next hit targets, center controls).
-      // If we set an extreme z-index, the invisible edge buttons won't receive taps.
-      videoEl.style.zIndex = '2';
       videoEl.style.backgroundColor = 'black';
       videoEl.style.display = 'block';
       videoEl.style.visibility = 'visible';
       videoEl.style.opacity = '1';
-
-      // Let overlay controls receive taps; the app uses its own hit layers.
+      // Let overlay controls receive taps.
       videoEl.style.pointerEvents = 'none';
 
       videoEl.__localweb_soft_fullscreen_active__ = true;
@@ -857,35 +1146,47 @@
       if (!videoEl.__localweb_soft_fullscreen_active__) return true;
 
       var prev = videoEl.__localweb_soft_fullscreen_prev_style__ || null;
+      var root = videoEl.__localweb_soft_fullscreen_root__ || null;
+
+      // Restore wrapper styles first.
+      try {
+        if (root && root.style && root.__localweb_soft_fullscreen_prev_style__) {
+          var rp = root.__localweb_soft_fullscreen_prev_style__;
+          root.style.position = rp.position || '';
+          root.style.left = rp.left || '';
+          root.style.top = rp.top || '';
+          root.style.right = rp.right || '';
+          root.style.bottom = rp.bottom || '';
+          root.style.width = rp.width || '';
+          root.style.height = rp.height || '';
+          root.style.maxWidth = rp.maxWidth || '';
+          root.style.maxHeight = rp.maxHeight || '';
+          root.style.zIndex = rp.zIndex || '';
+          root.style.backgroundColor = rp.backgroundColor || '';
+        }
+      } catch (e) {}
+      try {
+        if (root) root.__localweb_soft_fullscreen_prev_style__ = undefined;
+      } catch (e) {}
+      try { videoEl.__localweb_soft_fullscreen_root__ = null; } catch (e) {}
+
       if (prev) {
-        videoEl.style.position = prev.position || '';
-        videoEl.style.left = prev.left || '';
-        videoEl.style.top = prev.top || '';
-        videoEl.style.right = prev.right || '';
-        videoEl.style.bottom = prev.bottom || '';
         videoEl.style.width = prev.width || '';
         videoEl.style.height = prev.height || '';
         videoEl.style.maxWidth = prev.maxWidth || '';
         videoEl.style.maxHeight = prev.maxHeight || '';
         videoEl.style.objectFit = prev.objectFit || '';
-        videoEl.style.zIndex = prev.zIndex || '';
         videoEl.style.backgroundColor = prev.backgroundColor || '';
         videoEl.style.display = prev.display || '';
         videoEl.style.visibility = prev.visibility || '';
         videoEl.style.opacity = prev.opacity || '';
         videoEl.style.pointerEvents = prev.pointerEvents || '';
       } else {
-        videoEl.style.position = '';
-        videoEl.style.left = '';
-        videoEl.style.top = '';
-        videoEl.style.right = '';
-        videoEl.style.bottom = '';
         videoEl.style.width = '';
         videoEl.style.height = '';
         videoEl.style.maxWidth = '';
         videoEl.style.maxHeight = '';
         videoEl.style.objectFit = '';
-        videoEl.style.zIndex = '';
         videoEl.style.backgroundColor = '';
         videoEl.style.display = '';
         videoEl.style.visibility = '';
@@ -933,6 +1234,11 @@
       try {
         var on = !!(document.fullscreenElement);
         logHostSignal('fullscreen=' + (on ? '1' : '0'));
+        // Fullscreen transitions can leave the video hidden; recover proactively.
+        try {
+          var v = document.querySelector ? document.querySelector('video') : null;
+          if (v) forceShowVideoIfHidden(v, 'fullscreenchange');
+        } catch (e) {}
       } catch (e) {}
     }, true);
   } catch (e) {}
