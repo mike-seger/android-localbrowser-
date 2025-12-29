@@ -1,13 +1,19 @@
 package com.net128.android.localwebbrowser
 
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
+import android.util.Log
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.MimeTypeMap
+import android.webkit.WebSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -53,6 +59,7 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.core.net.toUri
 import com.net128.android.localwebbrowser.ui.theme.LocalWebbrowserTheme
 import java.io.InputStream
+import java.nio.charset.StandardCharsets
 import java.net.URLConnection
 
 class MainActivity : ComponentActivity() {
@@ -73,6 +80,7 @@ class MainActivity : ComponentActivity() {
 fun LocalWebbrowserApp() {
     var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
     var selectedFileUri by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedFolderUri by rememberSaveable { mutableStateOf<String?>(null) }
 
     NavigationSuiteScaffold(
         navigationSuiteItems = {
@@ -95,15 +103,17 @@ fun LocalWebbrowserApp() {
 
                 AppDestinations.BROWSER -> BrowserScreen(
                     modifier = Modifier.padding(innerPadding),
-                    onFileSelected = { uri ->
-                        selectedFileUri = uri
+                    onFileSelected = { fileUri, folderUri ->
+                        selectedFileUri = fileUri
+                        selectedFolderUri = folderUri
                         currentDestination = AppDestinations.WEBVIEW
                     }
                 )
 
                 AppDestinations.WEBVIEW -> WebViewScreen(
                     modifier = Modifier.padding(innerPadding),
-                    uri = selectedFileUri
+                    uri = selectedFileUri,
+                    folderUri = selectedFolderUri
                 )
             }
         }
@@ -133,7 +143,7 @@ fun GreetingPreview() {
 @Composable
 fun BrowserScreen(
     modifier: Modifier = Modifier,
-    onFileSelected: (String) -> Unit,
+    onFileSelected: (fileUri: String, folderUri: String?) -> Unit,
 ) {
     val context = LocalContext.current
     var currentUri by rememberSaveable { mutableStateOf<String?>(null) }
@@ -200,7 +210,7 @@ fun BrowserScreen(
                                     currentUri?.let { backStack = backStack + it }
                                     currentUri = file.uri.toString()
                                 } else {
-                                    onFileSelected(file.uri.toString())
+                                    onFileSelected(file.uri.toString(), currentUri)
                                 }
                             }
                             .padding(12.dp),
@@ -226,37 +236,90 @@ fun BrowserScreen(
 }
 
 @Composable
-fun WebViewScreen(modifier: Modifier = Modifier, uri: String?) {
+fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String?) {
     val context = LocalContext.current
+    val logTag = "LocalWebView"
     val selectedFile = remember(uri) {
         uri?.let { DocumentFile.fromSingleUri(context, Uri.parse(it)) }
     }
 
-    // Resolve MIME type for SAF resources so CSS/JS/fonts load correctly.
-    fun guessMimeType(target: Uri): String {
-        val lastSegment = target.lastPathSegment ?: ""
-        // Strip query/fragment before extension lookup.
-        val cleanSegment = lastSegment.substringBefore('?').substringBefore('#')
-        val ext = cleanSegment.substringAfterLast('.', missingDelimiterValue = "").lowercase()
+    val selectedFolder = remember(folderUri) {
+        folderUri?.let { DocumentFile.fromTreeUri(context, Uri.parse(it)) }
+    }
+
+    // Resolve MIME type for local resources so CSS/JS/fonts load correctly.
+    fun guessMimeTypeFromPath(pathOrName: String): String {
+        val clean = pathOrName.substringBefore('?').substringBefore('#')
+        val ext = clean.substringAfterLast('.', missingDelimiterValue = "").lowercase()
         return when (ext) {
             "css" -> "text/css"
             "js", "mjs" -> "text/javascript"
             "json" -> "application/json"
             "html", "htm" -> "text/html"
             "svg" -> "image/svg+xml"
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "gif" -> "image/gif"
+            "webp" -> "image/webp"
             "woff" -> "font/woff"
             "woff2" -> "font/woff2"
             "ttf" -> "font/ttf"
-            else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: URLConnection.guessContentTypeFromName(cleanSegment) ?: "application/octet-stream"
+            "mp3" -> "audio/mpeg"
+            "m4a" -> "audio/mp4"
+            "mp4" -> "video/mp4"
+            else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                ?: URLConnection.guessContentTypeFromName(clean)
+                ?: "application/octet-stream"
         }
     }
 
-    fun interceptContentRequest(request: WebResourceRequest): WebResourceResponse? {
-        if (request.url.scheme != "content") return null
+    fun encodingForMime(mime: String): String? {
+        return if (mime.startsWith("text/") || mime == "application/json" || mime == "text/javascript") "utf-8" else null
+    }
+
+    fun readTextFromUri(target: Uri): String? {
         return try {
-            val mime = guessMimeType(request.url)
-            val stream: InputStream? = context.contentResolver.openInputStream(request.url)
-            if (stream != null) WebResourceResponse(mime, "utf-8", stream) else null
+            context.contentResolver.openInputStream(target)?.use { input ->
+                input.readBytes().toString(StandardCharsets.UTF_8)
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun resolveInFolder(folder: DocumentFile, relativePath: String): DocumentFile? {
+        val cleanPath = relativePath.trimStart('/').substringBefore('?').substringBefore('#')
+        if (cleanPath.isBlank()) return null
+        var current: DocumentFile = folder
+        val parts = cleanPath.split('/').filter { it.isNotBlank() }
+        for ((index, part) in parts.withIndex()) {
+            val next = current.findFile(part) ?: return null
+            if (index < parts.lastIndex && !next.isDirectory) return null
+            current = next
+        }
+        return current
+    }
+
+    val localHost = "local.web"
+    val localBaseUrl = "https://$localHost/"
+
+    fun interceptLocalRequest(request: WebResourceRequest): WebResourceResponse? {
+        // Serve subresources from the selected folder via a stable https:// origin.
+        val url = request.url
+        if (url.scheme != "https" || url.host != localHost) return null
+        val folder = selectedFolder ?: return null
+        val relPath = url.encodedPath ?: return null
+
+        val file = resolveInFolder(folder, relPath) ?: run {
+            Log.w(logTag, "Missing local resource: $url")
+            return null
+        }
+        if (file.isDirectory) return null
+
+        return try {
+            val mime = guessMimeTypeFromPath(relPath)
+            val stream = context.contentResolver.openInputStream(file.uri) ?: return null
+            WebResourceResponse(mime, encodingForMime(mime), stream)
         } catch (_: Exception) {
             null
         }
@@ -281,21 +344,88 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?) {
                 modifier = Modifier.fillMaxSize(),
                 factory = {
                     WebView(context).apply {
+                        val isDebuggable = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+                        if (isDebuggable) WebView.setWebContentsDebuggingEnabled(true)
+
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.allowContentAccess = true
                         settings.allowFileAccess = true
                         settings.allowUniversalAccessFromFileURLs = true
                         settings.allowFileAccessFromFileURLs = true
+                        settings.useWideViewPort = true
+                        settings.loadWithOverviewMode = true
+                        settings.textZoom = 100
+                        settings.cacheMode = WebSettings.LOAD_DEFAULT
+
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+                                val src = consoleMessage.sourceId().substringAfterLast('/')
+                                Log.d(
+                                    logTag,
+                                    "console(${consoleMessage.messageLevel()}): ${consoleMessage.message()} ($src:${consoleMessage.lineNumber()})"
+                                )
+                                return true
+                            }
+                        }
+
                         webViewClient = object : WebViewClient() {
                             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest): WebResourceResponse? {
-                                return interceptContentRequest(request) ?: super.shouldInterceptRequest(view, request)
+                                return interceptLocalRequest(request) ?: super.shouldInterceptRequest(view, request)
+                            }
+
+                            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                                Log.d(logTag, "pageStarted: $url")
+                                super.onPageStarted(view, url, favicon)
+                            }
+
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                Log.d(logTag, "pageFinished: $url")
+                                super.onPageFinished(view, url)
+                            }
+
+                            override fun onReceivedError(
+                                view: WebView?,
+                                request: WebResourceRequest,
+                                error: android.webkit.WebResourceError
+                            ) {
+                                Log.e(
+                                    logTag,
+                                    "receivedError: ${request.url} mainFrame=${request.isForMainFrame} code=${error.errorCode} desc=${error.description}"
+                                )
+                                super.onReceivedError(view, request, error)
+                            }
+
+                            override fun onReceivedHttpError(
+                                view: WebView?,
+                                request: WebResourceRequest,
+                                errorResponse: WebResourceResponse
+                            ) {
+                                Log.e(
+                                    logTag,
+                                    "httpError: ${request.url} mainFrame=${request.isForMainFrame} status=${errorResponse.statusCode} reason=${errorResponse.reasonPhrase}"
+                                )
+                                super.onReceivedHttpError(view, request, errorResponse)
                             }
                         }
                     }
                 },
                 update = { webView ->
-                    if (webView.url != uri) {
+                    // Load the HTML itself via SAF, but give it a stable base URL so
+                    // relative CSS/JS/fonts/img resolve and can be intercepted.
+                    val fileUri = Uri.parse(uri)
+                    val html = readTextFromUri(fileUri)
+                    if (html != null) {
+                        Log.d(logTag, "loadDataWithBaseURL base=$localBaseUrl htmlUri=$fileUri")
+                        webView.loadDataWithBaseURL(
+                            localBaseUrl,
+                            html,
+                            "text/html",
+                            "utf-8",
+                            null
+                        )
+                    } else {
+                        Log.w(logTag, "Falling back to loadUrl for $fileUri")
                         webView.loadUrl(uri)
                     }
                 }
