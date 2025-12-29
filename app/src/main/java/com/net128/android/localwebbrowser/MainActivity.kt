@@ -46,6 +46,7 @@ import androidx.compose.material.icons.filled.Web
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -60,8 +61,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.tooling.preview.PreviewScreenSizes
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.documentfile.provider.DocumentFile
@@ -77,6 +80,13 @@ import java.net.URLConnection
 private const val PREFS_NAME = "localwebbrowser"
 private const val PREF_LAST_FOLDER_URI = "lastFolderUri"
 private const val PREF_LAST_FILE_URI = "lastFileUri"
+private const val PREF_LAST_URL = "lastUrl"
+private const val PREF_LAST_MODE = "lastMode"
+
+enum class ContentMode {
+    LOCAL,
+    URL,
+}
 
 private fun prefs(context: Context): SharedPreferences =
     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -118,13 +128,27 @@ class MainActivity : ComponentActivity() {
 fun LocalWebbrowserApp() {
     val context = LocalContext.current
 
-    var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
-
     val savedLastFile = remember { prefs(context).getString(PREF_LAST_FILE_URI, null) }
     val savedLastFolder = remember { prefs(context).getString(PREF_LAST_FOLDER_URI, null) }
+    val savedLastUrl = remember { prefs(context).getString(PREF_LAST_URL, null) }
+    val savedLastModeRaw = remember { prefs(context).getString(PREF_LAST_MODE, ContentMode.LOCAL.name) }
+    val savedLastMode = remember(savedLastModeRaw) {
+        runCatching { ContentMode.valueOf(savedLastModeRaw ?: ContentMode.LOCAL.name) }.getOrDefault(ContentMode.LOCAL)
+    }
 
     var selectedFileUri by rememberSaveable { mutableStateOf(savedLastFile) }
     var selectedFolderUri by rememberSaveable { mutableStateOf(savedLastFolder) }
+    var selectedUrl by rememberSaveable { mutableStateOf(savedLastUrl) }
+    var selectedMode by rememberSaveable { mutableStateOf(savedLastMode) }
+
+    val initialDestination = remember(savedLastMode, savedLastUrl, savedLastFile) {
+        when (savedLastMode) {
+            ContentMode.URL -> if (!savedLastUrl.isNullOrBlank()) AppDestinations.WEBVIEW else AppDestinations.HOME
+            ContentMode.LOCAL -> if (!savedLastFile.isNullOrBlank()) AppDestinations.WEBVIEW else AppDestinations.HOME
+        }
+    }
+
+    var currentDestination by rememberSaveable { mutableStateOf(initialDestination) }
 
     NavigationSuiteScaffold(
         navigationSuiteItems = {
@@ -150,10 +174,28 @@ fun LocalWebbrowserApp() {
                     onFileSelected = { fileUri, folderUri ->
                         selectedFileUri = fileUri
                         selectedFolderUri = folderUri
+                        selectedMode = ContentMode.LOCAL
 
                         prefs(context).edit()
                             .putString(PREF_LAST_FILE_URI, fileUri)
                             .putString(PREF_LAST_FOLDER_URI, folderUri)
+                            .putString(PREF_LAST_MODE, ContentMode.LOCAL.name)
+                            .apply()
+
+                        currentDestination = AppDestinations.WEBVIEW
+                    }
+                )
+
+                AppDestinations.URL -> UrlScreen(
+                    modifier = Modifier.padding(innerPadding),
+                    initialUrl = selectedUrl,
+                    onLoadUrl = { url ->
+                        selectedUrl = url
+                        selectedMode = ContentMode.URL
+
+                        prefs(context).edit()
+                            .putString(PREF_LAST_URL, url)
+                            .putString(PREF_LAST_MODE, ContentMode.URL.name)
                             .apply()
 
                         currentDestination = AppDestinations.WEBVIEW
@@ -163,7 +205,9 @@ fun LocalWebbrowserApp() {
                 AppDestinations.WEBVIEW -> WebViewScreen(
                     modifier = Modifier.padding(innerPadding),
                     uri = selectedFileUri,
-                    folderUri = selectedFolderUri
+                    folderUri = selectedFolderUri,
+                    url = selectedUrl,
+                    mode = selectedMode,
                 )
             }
         }
@@ -176,7 +220,51 @@ enum class AppDestinations(
 ) {
     HOME("Home", Icons.Default.Home),
     BROWSER("Browser", Icons.Default.Folder),
+    URL("URL", Icons.Default.Description),
     WEBVIEW("WebView", Icons.Default.Web),
+}
+
+@Composable
+fun UrlScreen(
+    modifier: Modifier = Modifier,
+    initialUrl: String?,
+    onLoadUrl: (String) -> Unit,
+) {
+    var url by rememberSaveable(initialUrl) { mutableStateOf(initialUrl ?: "") }
+    val trimmed = url.trim()
+    val isHttpUrl = trimmed.startsWith("https://", ignoreCase = true) || trimmed.startsWith("http://", ignoreCase = true)
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(text = "Load from URL", style = MaterialTheme.typography.titleMedium)
+
+        OutlinedTextField(
+            value = url,
+            onValueChange = { url = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("http(s) URL") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+        )
+
+        if (trimmed.isNotEmpty() && !isHttpUrl) {
+            Text(
+                text = "URL must start with http:// or https://",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+
+        Button(
+            onClick = { onLoadUrl(trimmed) },
+            enabled = trimmed.isNotEmpty() && isHttpUrl,
+        ) {
+            Text("Load")
+        }
+    }
 }
 
 @Composable
@@ -305,7 +393,13 @@ fun BrowserScreen(
 }
 
 @Composable
-fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String?) {
+fun WebViewScreen(
+    modifier: Modifier = Modifier,
+    uri: String?,
+    folderUri: String?,
+    url: String?,
+    mode: ContentMode,
+) {
     val context = LocalContext.current
     val logTag = "LocalWebView"
     var lastLoadedKey by remember { mutableStateOf<String?>(null) }
@@ -313,7 +407,9 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
     var interceptedBytes by remember { mutableStateOf(0L) }
     var lastStatsAtMs by remember { mutableStateOf(SystemClock.elapsedRealtime()) }
     var loggedFolderContext by remember(folderUri, uri) { mutableStateOf(false) }
-    val selectedFile = remember(uri) {
+    val isLocalMode = mode == ContentMode.LOCAL
+    val selectedFile = remember(uri, mode) {
+        if (!isLocalMode) return@remember null
         uri?.let { DocumentFile.fromSingleUri(context, Uri.parse(it)) }
     }
 
@@ -322,7 +418,8 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
         val baseDocId: String,
     )
 
-    val folderContext = remember(uri, folderUri) {
+    val folderContext = remember(uri, folderUri, mode) {
+        if (!isLocalMode) return@remember null
         // Prefer an explicit folder URI from the browser. If it's missing (e.g., restored state),
         // derive the folder from the selected HTML file's document id.
         val baseUri = when {
@@ -769,6 +866,7 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
     }
 
     fun interceptLocalRequest(request: WebResourceRequest): WebResourceResponse? {
+        if (!isLocalMode) return null
         // Serve subresources from the selected folder via a stable https:// origin.
         val url = request.url
         if (url.scheme != "https" || url.host != localHost) return null
@@ -833,15 +931,19 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text(
-            text = selectedFile?.name ?: uri ?: "No file selected. Pick an HTML file in Browser.",
-            style = MaterialTheme.typography.titleMedium
-        )
-        if (uri != null) {
-            SelectionContainer { Text(uri, style = MaterialTheme.typography.bodySmall) }
+        val headerText = when {
+            isLocalMode -> selectedFile?.name ?: uri ?: "No file selected. Pick an HTML file in Browser."
+            else -> url ?: "No URL selected. Enter a URL in URL tab."
+        }
+        Text(text = headerText, style = MaterialTheme.typography.titleMedium)
+
+        val detail = if (isLocalMode) uri else url
+        if (!detail.isNullOrBlank()) {
+            SelectionContainer { Text(detail, style = MaterialTheme.typography.bodySmall) }
         }
 
-        if (uri != null) {
+        val shouldShowWebView = if (isLocalMode) uri != null else !url.isNullOrBlank()
+        if (shouldShowWebView) {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = {
@@ -1053,30 +1155,43 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
                     }
                 },
                 update = { webView ->
-                    // Load the HTML itself via SAF, but give it a stable base URL so
-                    // relative CSS/JS/fonts/img resolve and can be intercepted.
-                    val fileUri = Uri.parse(uri)
-                    val loadKey = "${uri}@@${folderUri ?: ""}"
-                    if (lastLoadedKey != loadKey) {
-                        lastLoadedKey = loadKey
-                        val t0 = SystemClock.elapsedRealtime()
-                        val html = readTextFromUri(fileUri)
-                        val readMs = SystemClock.elapsedRealtime() - t0
-                        if (html != null) {
-                            Log.d(
-                                logTag,
-                                "loadDataWithBaseURL base=$localBaseUrl htmlUri=$fileUri htmlBytes=${html.toByteArray(StandardCharsets.UTF_8).size} readMs=${readMs}"
-                            )
-                            webView.loadDataWithBaseURL(
-                                localBaseUrl,
-                                html,
-                                "text/html",
-                                "utf-8",
-                                null
-                            )
-                        } else {
-                            Log.w(logTag, "Falling back to loadUrl for $fileUri")
-                            webView.loadUrl(uri)
+                    if (isLocalMode) {
+                        // Load the HTML itself via SAF, but give it a stable base URL so
+                        // relative CSS/JS/fonts/img resolve and can be intercepted.
+                        val safeUri = uri
+                        if (safeUri != null) {
+                            val fileUri = Uri.parse(safeUri)
+                            val loadKey = "local@@${safeUri}@@${folderUri ?: ""}"
+                            if (lastLoadedKey != loadKey) {
+                                lastLoadedKey = loadKey
+                                val t0 = SystemClock.elapsedRealtime()
+                                val html = readTextFromUri(fileUri)
+                                val readMs = SystemClock.elapsedRealtime() - t0
+                                if (html != null) {
+                                    Log.d(
+                                        logTag,
+                                        "loadDataWithBaseURL base=$localBaseUrl htmlUri=$fileUri htmlBytes=${html.toByteArray(StandardCharsets.UTF_8).size} readMs=${readMs}"
+                                    )
+                                    webView.loadDataWithBaseURL(
+                                        localBaseUrl,
+                                        html,
+                                        "text/html",
+                                        "utf-8",
+                                        null
+                                    )
+                                } else {
+                                    Log.w(logTag, "Falling back to loadUrl for $fileUri")
+                                    webView.loadUrl(safeUri)
+                                }
+                            }
+                        }
+                    } else {
+                        val targetUrl = url?.trim().orEmpty()
+                        val loadKey = "url@@$targetUrl"
+                        if (lastLoadedKey != loadKey && targetUrl.isNotBlank()) {
+                            lastLoadedKey = loadKey
+                            Log.d(logTag, "loadUrl: $targetUrl")
+                            webView.loadUrl(targetUrl)
                         }
                     }
                 }
