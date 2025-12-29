@@ -58,6 +58,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.documentfile.provider.DocumentFile
 import androidx.core.net.toUri
 import com.net128.android.localwebbrowser.ui.theme.LocalWebbrowserTheme
+import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.net.URLConnection
@@ -239,6 +240,7 @@ fun BrowserScreen(
 fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String?) {
     val context = LocalContext.current
     val logTag = "LocalWebView"
+    var lastLoadedKey by remember { mutableStateOf<String?>(null) }
     val selectedFile = remember(uri) {
         uri?.let { DocumentFile.fromSingleUri(context, Uri.parse(it)) }
     }
@@ -291,7 +293,7 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
         val cleanPath = relativePath.trimStart('/').substringBefore('?').substringBefore('#')
         if (cleanPath.isBlank()) return null
         var current: DocumentFile = folder
-        val parts = cleanPath.split('/').filter { it.isNotBlank() }
+        val parts = cleanPath.split('/').filter { it.isNotBlank() }.map { Uri.decode(it) }
         for ((index, part) in parts.withIndex()) {
             val next = current.findFile(part) ?: return null
             if (index < parts.lastIndex && !next.isDirectory) return null
@@ -303,25 +305,51 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
     val localHost = "local.web"
     val localBaseUrl = "https://$localHost/"
 
+    fun notFound(url: Uri): WebResourceResponse {
+        val body = ByteArrayInputStream("Not Found: $url".toByteArray(StandardCharsets.UTF_8))
+        return WebResourceResponse(
+            "text/plain",
+            "utf-8",
+            404,
+            "Not Found",
+            mapOf("Cache-Control" to "no-store"),
+            body
+        )
+    }
+
+    fun serverError(url: Uri, message: String): WebResourceResponse {
+        val body = ByteArrayInputStream(message.toByteArray(StandardCharsets.UTF_8))
+        return WebResourceResponse(
+            "text/plain",
+            "utf-8",
+            500,
+            "Internal Server Error",
+            mapOf("Cache-Control" to "no-store"),
+            body
+        )
+    }
+
     fun interceptLocalRequest(request: WebResourceRequest): WebResourceResponse? {
         // Serve subresources from the selected folder via a stable https:// origin.
         val url = request.url
         if (url.scheme != "https" || url.host != localHost) return null
-        val folder = selectedFolder ?: return null
-        val relPath = url.encodedPath ?: return null
+        val folder = selectedFolder
+        val relPath = url.encodedPath ?: return notFound(url)
+        if (folder == null) return notFound(url)
 
         val file = resolveInFolder(folder, relPath) ?: run {
             Log.w(logTag, "Missing local resource: $url")
-            return null
+            return notFound(url)
         }
-        if (file.isDirectory) return null
+        if (file.isDirectory) return notFound(url)
 
         return try {
             val mime = guessMimeTypeFromPath(relPath)
-            val stream = context.contentResolver.openInputStream(file.uri) ?: return null
-            WebResourceResponse(mime, encodingForMime(mime), stream)
-        } catch (_: Exception) {
-            null
+            val stream = context.contentResolver.openInputStream(file.uri)
+                ?: return serverError(url, "Failed to open stream")
+            WebResourceResponse(mime, encodingForMime(mime), 200, "OK", emptyMap(), stream)
+        } catch (e: Exception) {
+            serverError(url, "Exception while serving resource: ${e.message}")
         }
     }
 
@@ -414,19 +442,23 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
                     // Load the HTML itself via SAF, but give it a stable base URL so
                     // relative CSS/JS/fonts/img resolve and can be intercepted.
                     val fileUri = Uri.parse(uri)
-                    val html = readTextFromUri(fileUri)
-                    if (html != null) {
-                        Log.d(logTag, "loadDataWithBaseURL base=$localBaseUrl htmlUri=$fileUri")
-                        webView.loadDataWithBaseURL(
-                            localBaseUrl,
-                            html,
-                            "text/html",
-                            "utf-8",
-                            null
-                        )
-                    } else {
-                        Log.w(logTag, "Falling back to loadUrl for $fileUri")
-                        webView.loadUrl(uri)
+                    val loadKey = "${uri}@@${folderUri ?: ""}"
+                    if (lastLoadedKey != loadKey) {
+                        lastLoadedKey = loadKey
+                        val html = readTextFromUri(fileUri)
+                        if (html != null) {
+                            Log.d(logTag, "loadDataWithBaseURL base=$localBaseUrl htmlUri=$fileUri")
+                            webView.loadDataWithBaseURL(
+                                localBaseUrl,
+                                html,
+                                "text/html",
+                                "utf-8",
+                                null
+                            )
+                        } else {
+                            Log.w(logTag, "Falling back to loadUrl for $fileUri")
+                            webView.loadUrl(uri)
+                        }
                     }
                 }
             )
