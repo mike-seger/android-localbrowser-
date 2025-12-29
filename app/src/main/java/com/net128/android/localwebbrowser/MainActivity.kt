@@ -8,10 +8,12 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.util.Log
+import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebView
@@ -66,6 +68,8 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.core.net.toUri
 import com.net128.android.localwebbrowser.ui.theme.LocalWebbrowserTheme
 import java.io.ByteArrayInputStream
+import java.io.FileInputStream
+import java.io.FilterInputStream
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.net.URLConnection
@@ -359,6 +363,221 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
         val sizeBytes: Long?,
     )
 
+    class LimitedInputStream(
+        input: InputStream,
+        private var remaining: Long,
+    ) : FilterInputStream(input) {
+        override fun read(): Int {
+            if (remaining <= 0) return -1
+            val v = super.read()
+            if (v >= 0) remaining -= 1
+            return v
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (remaining <= 0) return -1
+            val toRead = if (remaining < len.toLong()) remaining.toInt() else len
+            val n = super.read(b, off, toRead)
+            if (n > 0) remaining -= n.toLong()
+            return n
+        }
+    }
+
+    data class ByteRange(
+        val startInclusive: Long,
+        val endInclusive: Long,
+        val totalSize: Long,
+    ) {
+        val length: Long get() = (endInclusive - startInclusive + 1)
+    }
+
+    fun parseByteRangeHeader(rangeHeader: String, totalSize: Long): ByteRange? {
+        // Supports single range only.
+        // Examples: bytes=0-499, bytes=500-, bytes=-500
+        val raw = rangeHeader.trim()
+        if (!raw.startsWith("bytes=", ignoreCase = true)) return null
+        val spec = raw.substringAfter('=', "").trim()
+        if (spec.isBlank()) return null
+        if (spec.contains(',')) return null
+        val dashIndex = spec.indexOf('-')
+        if (dashIndex < 0) return null
+
+        val startPart = spec.substring(0, dashIndex).trim()
+        val endPart = spec.substring(dashIndex + 1).trim()
+
+        if (totalSize <= 0L) return null
+
+        val start: Long
+        val end: Long
+
+        if (startPart.isEmpty()) {
+            // Suffix range: last N bytes
+            val suffixLen = endPart.toLongOrNull() ?: return null
+            if (suffixLen <= 0) return null
+            val clampedSuffix = if (suffixLen > totalSize) totalSize else suffixLen
+            start = totalSize - clampedSuffix
+            end = totalSize - 1
+        } else {
+            start = startPart.toLongOrNull() ?: return null
+            if (start < 0) return null
+            end = if (endPart.isEmpty()) {
+                totalSize - 1
+            } else {
+                endPart.toLongOrNull() ?: return null
+            }
+        }
+
+        if (start >= totalSize) return null
+        val clampedEnd = if (end >= totalSize) totalSize - 1 else end
+        if (clampedEnd < start) return null
+        return ByteRange(startInclusive = start, endInclusive = clampedEnd, totalSize = totalSize)
+    }
+
+    fun serveWithOptionalRange(
+        url: Uri,
+        resolved: ResolvedDoc,
+        mime: String,
+        request: WebResourceRequest,
+    ): WebResourceResponse {
+        val encoding = if (mime.startsWith("text/") || mime == "application/json" || mime == "text/javascript") "utf-8" else null
+        val rangeHeader = request.requestHeaders["Range"] ?: request.requestHeaders["range"]
+        val totalSize = resolved.sizeBytes
+
+        val method = request.method ?: "GET"
+        val isHead = method.equals("HEAD", ignoreCase = true)
+
+        val shouldLog = mime.startsWith("video/") || mime.startsWith("audio/") || !rangeHeader.isNullOrBlank() || isHead
+
+        fun wrapWithCloseLogging(
+            input: InputStream,
+            expectedBytes: Long?,
+            label: String,
+        ): InputStream {
+            if (!shouldLog) return input
+            return object : FilterInputStream(input) {
+                private var readBytes: Long = 0
+
+                override fun read(): Int {
+                    val v = super.read()
+                    if (v >= 0) readBytes += 1
+                    return v
+                }
+
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    val n = super.read(b, off, len)
+                    if (n > 0) readBytes += n.toLong()
+                    return n
+                }
+
+                override fun close() {
+                    try {
+                        super.close()
+                    } finally {
+                        val exp = expectedBytes
+                        if (exp != null && exp > 0 && readBytes < exp) {
+                            Log.w(logTag, "media stream closed early: read=$readBytes expected=$exp $label url=$url")
+                        } else {
+                            Log.d(logTag, "media stream closed: read=$readBytes expected=${exp ?: -1} $label url=$url")
+                        }
+                    }
+                }
+            }
+        }
+
+        val range = if (!rangeHeader.isNullOrBlank() && totalSize != null && totalSize > 0) {
+            parseByteRangeHeader(rangeHeader, totalSize)
+        } else {
+            null
+        }
+
+        // If there is a Range header but we can't satisfy it, fall back to a full response.
+        // (Returning 416 is more correct, but fallback is friendlier and avoids regressions.)
+        val response = if (range != null) {
+            val headers = mutableMapOf(
+                "Accept-Ranges" to "bytes",
+                "Content-Range" to "bytes ${range.startInclusive}-${range.endInclusive}/${range.totalSize}",
+                "Content-Length" to range.length.toString(),
+                "Cache-Control" to "no-store",
+            )
+
+            val body: InputStream = if (isHead) {
+                ByteArrayInputStream(ByteArray(0))
+            } else {
+                val pfd: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(resolved.uri, "r")
+                    ?: throw IllegalStateException("Failed to open file descriptor")
+                val fis = FileInputStream(pfd.fileDescriptor)
+                try {
+                    fis.channel.position(range.startInclusive)
+                } catch (_: Exception) {
+                    // Fallback to skipping (less efficient).
+                    var toSkip = range.startInclusive
+                    while (toSkip > 0) {
+                        val skipped = fis.skip(toSkip)
+                        if (skipped <= 0) break
+                        toSkip -= skipped
+                    }
+                }
+
+                val limited = LimitedInputStream(fis, range.length)
+                val closeWrapped = object : FilterInputStream(limited) {
+                    override fun close() {
+                        try {
+                            super.close()
+                        } finally {
+                            try {
+                                pfd.close()
+                            } catch (_: Exception) {
+                                // ignore
+                            }
+                        }
+                    }
+                }
+
+                wrapWithCloseLogging(
+                    closeWrapped,
+                    expectedBytes = range.length,
+                    label = "range=${range.startInclusive}-${range.endInclusive}",
+                )
+            }
+
+            WebResourceResponse(mime, encoding, 206, "Partial Content", headers, body)
+        } else {
+            val headers = mutableMapOf(
+                "Accept-Ranges" to "bytes",
+                "Cache-Control" to "no-store",
+            )
+            if (totalSize != null && totalSize > 0) {
+                headers["Content-Length"] = totalSize.toString()
+            }
+
+            val body: InputStream = if (isHead) {
+                ByteArrayInputStream(ByteArray(0))
+            } else {
+                val raw = context.contentResolver.openInputStream(resolved.uri)
+                    ?: throw IllegalStateException("Failed to open stream")
+
+                wrapWithCloseLogging(
+                    raw,
+                    expectedBytes = totalSize,
+                    label = "full",
+                )
+            }
+
+            WebResourceResponse(mime, encoding, 200, "OK", headers, body)
+        }
+
+        if (shouldLog) {
+            val cr = response.responseHeaders?.get("Content-Range")
+            val cl = response.responseHeaders?.get("Content-Length")
+            Log.d(
+                logTag,
+                "serveLocal: ${method.uppercase()} mime=$mime size=${totalSize ?: -1} range=${rangeHeader ?: ""} -> ${response.statusCode} cr=${cr ?: ""} cl=${cl ?: ""} url=$url"
+            )
+        }
+
+        return response
+    }
+
     // Resolve MIME type for local resources so CSS/JS/fonts load correctly.
     fun guessMimeTypeFromPath(pathOrName: String): String {
         val clean = pathOrName.substringBefore('?').substringBefore('#')
@@ -579,14 +798,18 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
         return try {
             val mime = guessMimeTypeFromPath(relPath)
             val streamStartMs = SystemClock.elapsedRealtime()
-            val stream = context.contentResolver.openInputStream(resolved.uri)
-                ?: return serverError(url, "Failed to open stream")
+            val response = serveWithOptionalRange(url, resolved, mime, request)
             val openMs = SystemClock.elapsedRealtime() - streamStartMs
 
             // Periodic stats (kept lightweight).
             interceptedCount += 1
-            val size = resolved.sizeBytes ?: -1L
-            if (size > 0) interceptedBytes += size
+            val servedBytes = when {
+                response.statusCode == 206 -> {
+                    response.responseHeaders?.get("Content-Length")?.toLongOrNull() ?: -1L
+                }
+                else -> resolved.sizeBytes ?: -1L
+            }
+            if (servedBytes > 0) interceptedBytes += servedBytes
             val nowMs = SystemClock.elapsedRealtime()
             if (nowMs - lastStatsAtMs > 2000) {
                 Log.d(logTag, "local served: count=$interceptedCount bytes=$interceptedBytes")
@@ -598,7 +821,7 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
                 Log.w(logTag, "slow local: ${totalMs}ms (resolve=${resolveMs}ms open=${openMs}ms) $url")
             }
 
-            WebResourceResponse(mime, encodingForMime(mime), 200, "OK", emptyMap(), stream)
+            response
         } catch (e: Exception) {
             serverError(url, "Exception while serving resource: ${e.message}")
         }
@@ -636,6 +859,7 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
                         settings.loadWithOverviewMode = true
                         settings.textZoom = 100
                         settings.cacheMode = WebSettings.LOAD_DEFAULT
+                        settings.mediaPlaybackRequiresUserGesture = false
 
                         webChromeClient = object : WebChromeClient() {
                             override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
@@ -645,6 +869,16 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
                                     "console(${consoleMessage.messageLevel()}): ${consoleMessage.message()} ($src:${consoleMessage.lineNumber()})"
                                 )
                                 return true
+                            }
+
+                            override fun onShowCustomView(view: View?, callback: WebChromeClient.CustomViewCallback?) {
+                                Log.d(logTag, "webChromeClient.onShowCustomView: view=${view?.javaClass?.name}")
+                                super.onShowCustomView(view, callback)
+                            }
+
+                            override fun onHideCustomView() {
+                                Log.d(logTag, "webChromeClient.onHideCustomView")
+                                super.onHideCustomView()
                             }
                         }
 
@@ -660,6 +894,135 @@ fun WebViewScreen(modifier: Modifier = Modifier, uri: String?, folderUri: String
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 Log.d(logTag, "pageFinished: $url")
+
+                                                                // Surface media playback failures (often swallowed by apps).
+                                                                // This keeps us in logs-only debugging mode without changing the web app.
+                                                                view?.evaluateJavascript(
+                                                                        """
+                                                                                (function() {
+                                                                                    if (window.__localweb_media_debug_installed__) return;
+                                                                                    window.__localweb_media_debug_installed__ = true;
+
+                                                                                    function safeToString(v) {
+                                                                                        try { return String(v); } catch (e) { return '[unstringifiable]'; }
+                                                                                    }
+
+                                                                                    window.addEventListener('unhandledrejection', function(ev) {
+                                                                                        var r = ev && ev.reason;
+                                                                                        console.log('[media-debug] unhandledrejection:', (r && r.name) || '', (r && r.message) || safeToString(r));
+                                                                                    });
+
+                                                                                    window.addEventListener('error', function(ev) {
+                                                                                        try {
+                                                                                            var msg = ev && (ev.message || ev.error && ev.error.message || ev.error);
+                                                                                            console.log('[media-debug] window.error:', safeToString(msg));
+                                                                                        } catch (e) {}
+                                                                                    });
+
+                                                                                    var origPlay = HTMLMediaElement.prototype.play;
+                                                                                    HTMLMediaElement.prototype.play = function() {
+                                                                                        try {
+                                                                                            try {
+                                                                                                console.log(
+                                                                                                    '[media-debug] play() called:',
+                                                                                                    (this && (this.currentSrc || this.src)) || '',
+                                                                                                    'paused=' + (!!this.paused),
+                                                                                                    'readyState=' + (this.readyState || 0),
+                                                                                                    'networkState=' + (this.networkState || 0)
+                                                                                                );
+                                                                                            } catch (e) {}
+                                                                                            var p = origPlay.apply(this, arguments);
+                                                                                            if (p && typeof p.then === 'function') {
+                                                                                                p.then(function() {
+                                                                                                    console.log('[media-debug] play() resolved');
+                                                                                                });
+                                                                                                p.catch(function(err) {
+                                                                                                    console.log('[media-debug] play() rejected:', (err && err.name) || '', (err && err.message) || safeToString(err));
+                                                                                                });
+                                                                                            }
+                                                                                            return p;
+                                                                                        } catch (err) {
+                                                                                            console.log('[media-debug] play() threw:', (err && err.name) || '', (err && err.message) || safeToString(err));
+                                                                                            throw err;
+                                                                                        }
+                                                                                    };
+
+                                                                                    function logMediaEvent(ev) {
+                                                                                        try {
+                                                                                            var el = ev && ev.target;
+                                                                                            if (!el || !el.tagName) return;
+                                                                                            var tag = String(el.tagName).toLowerCase();
+                                                                                            if (tag !== 'video' && tag !== 'audio') return;
+                                                                                            var src = (el.currentSrc || el.src || '');
+                                                                                            var err = el.error;
+                                                                                            var errCode = err && typeof err.code === 'number' ? err.code : '';
+
+                                                                                            function dumpMediaState(reason) {
+                                                                                                try {
+                                                                                                    // Throttle expensive state dumps.
+                                                                                                    var now = Date.now();
+                                                                                                    var last = el.__localweb_lastDumpTs__ || 0;
+                                                                                                    if (reason === 'timeupdate' && (now - last) < 2000) return;
+                                                                                                    el.__localweb_lastDumpTs__ = now;
+
+                                                                                                    var rect = (el.getBoundingClientRect && el.getBoundingClientRect()) || null;
+                                                                                                    var w = rect ? Math.round(rect.width) : -1;
+                                                                                                    var h = rect ? Math.round(rect.height) : -1;
+
+                                                                                                    var cs = (window.getComputedStyle && window.getComputedStyle(el)) || null;
+                                                                                                    var display = cs ? cs.display : '';
+                                                                                                    var visibility = cs ? cs.visibility : '';
+                                                                                                    var opacity = cs ? cs.opacity : '';
+
+                                                                                                    var vW = (tag === 'video' && typeof el.videoWidth === 'number') ? el.videoWidth : '';
+                                                                                                    var vH = (tag === 'video' && typeof el.videoHeight === 'number') ? el.videoHeight : '';
+
+                                                                                                    console.log(
+                                                                                                        '[media-debug] state:',
+                                                                                                        'reason=' + reason,
+                                                                                                        'tag=' + tag,
+                                                                                                        'src=' + src,
+                                                                                                        'currentTime=' + (typeof el.currentTime === 'number' ? el.currentTime.toFixed(3) : ''),
+                                                                                                        'duration=' + (typeof el.duration === 'number' ? el.duration.toFixed(3) : ''),
+                                                                                                        'muted=' + (!!el.muted),
+                                                                                                        'volume=' + (typeof el.volume === 'number' ? el.volume.toFixed(2) : ''),
+                                                                                                        (tag === 'video' ? ('videoWH=' + vW + 'x' + vH) : ''),
+                                                                                                        'rect=' + w + 'x' + h,
+                                                                                                        'display=' + display,
+                                                                                                        'visibility=' + visibility,
+                                                                                                        'opacity=' + opacity
+                                                                                                    );
+                                                                                                } catch (e) {}
+                                                                                            }
+
+                                                                                            console.log(
+                                                                                                '[media-debug] event:', ev.type,
+                                                                                                'src=' + src,
+                                                                                                'paused=' + (!!el.paused),
+                                                                                                'ended=' + (!!el.ended),
+                                                                                                'readyState=' + (el.readyState || 0),
+                                                                                                'networkState=' + (el.networkState || 0),
+                                                                                                (errCode !== '' ? ('errorCode=' + errCode) : '')
+                                                                                            );
+
+                                                                                            if (ev.type === 'loadedmetadata' || ev.type === 'playing' || ev.type === 'error') {
+                                                                                                dumpMediaState(ev.type);
+                                                                                            } else if (ev.type === 'timeupdate') {
+                                                                                                dumpMediaState('timeupdate');
+                                                                                            }
+                                                                                        } catch (e) {}
+                                                                                    }
+
+                                                                                    ['play','playing','pause','waiting','stalled','error','loadedmetadata','canplay','canplaythrough','seeking','seeked','timeupdate']
+                                                                                        .forEach(function(t) {
+                                                                                            document.addEventListener(t, logMediaEvent, true);
+                                                                                        });
+
+                                                                                    console.log('[media-debug] installed');
+                                                                                })();
+                                                                        """.trimIndent(),
+                                                                        null
+                                                                )
                                 super.onPageFinished(view, url)
                             }
 
