@@ -1094,6 +1094,18 @@ fun WebViewScreen(
                                                                                                         'visibility=' + visibility,
                                                                                                         'opacity=' + opacity
                                                                                                     );
+
+                                                                                                    // If video decodes but is invisible due to layout collapse (h == 0),
+                                                                                                    // apply a last-resort overlay fix so we can verify decoding/rendering.
+                                                                                                    try {
+                                                                                                        if (tag === 'video') {
+                                                                                                            var vw = (typeof el.videoWidth === 'number') ? el.videoWidth : 0;
+                                                                                                            var vh = (typeof el.videoHeight === 'number') ? el.videoHeight : 0;
+                                                                                                            if (vw > 0 && vh > 0 && h <= 1) {
+                                                                                                                ensureVideoVisible(el, reason);
+                                                                                                            }
+                                                                                                        }
+                                                                                                    } catch (e) {}
                                                                                                 } catch (e) {}
                                                                                             }
 
@@ -1119,6 +1131,119 @@ fun WebViewScreen(
                                                                                         .forEach(function(t) {
                                                                                             document.addEventListener(t, logMediaEvent, true);
                                                                                         });
+
+                                                                                    // ---- Viewport + layout stabilization (WebView vs Chrome) ----
+                                                                                    function getViewportHeightPx() {
+                                                                                        try {
+                                                                                            var vv = window.visualViewport;
+                                                                                            var h = vv && typeof vv.height === 'number' ? vv.height : 0;
+                                                                                            if (h && h > 0) return h;
+                                                                                        } catch (e) {}
+                                                                                        try {
+                                                                                            var ih = (typeof window.innerHeight === 'number') ? window.innerHeight : 0;
+                                                                                            if (ih && ih > 0) return ih;
+                                                                                        } catch (e) {}
+                                                                                        try {
+                                                                                            var ch = document && document.documentElement ? document.documentElement.clientHeight : 0;
+                                                                                            if (ch && ch > 0) return ch;
+                                                                                        } catch (e) {}
+                                                                                        return 0;
+                                                                                    }
+
+                                                                                    function setAppVh(reason) {
+                                                                                        try {
+                                                                                            var h = getViewportHeightPx();
+                                                                                            // Ignore transient zeros/silly small values.
+                                                                                            if (!h || h < 100) return;
+                                                                                            var oneVhPx = (h / 100);
+                                                                                            document.documentElement.style.setProperty('--app-vh', oneVhPx + 'px');
+                                                                                            if (!window.__localweb_last_vh__ || Math.abs(window.__localweb_last_vh__ - h) > 1) {
+                                                                                                window.__localweb_last_vh__ = h;
+                                                                                                console.log('[media-debug] set --app-vh:', 'h=' + Math.round(h), '1vh=' + oneVhPx.toFixed(2), 'reason=' + (reason || ''));
+                                                                                            }
+                                                                                        } catch (e) {}
+                                                                                    }
+
+                                                                                    var __vhTimer = null;
+                                                                                    function scheduleVh(reason) {
+                                                                                        try {
+                                                                                            if (__vhTimer) clearTimeout(__vhTimer);
+                                                                                            __vhTimer = setTimeout(function() { setAppVh(reason); }, 0);
+                                                                                        } catch (e) {}
+                                                                                    }
+
+                                                                                    scheduleVh('install');
+                                                                                    window.addEventListener('resize', function() { scheduleVh('window.resize'); }, true);
+                                                                                    window.addEventListener('orientationchange', function() { scheduleVh('orientationchange'); }, true);
+                                                                                    try {
+                                                                                        if (window.visualViewport) {
+                                                                                            window.visualViewport.addEventListener('resize', function() { scheduleVh('visualViewport.resize'); }, true);
+                                                                                            window.visualViewport.addEventListener('scroll', function() { scheduleVh('visualViewport.scroll'); }, true);
+                                                                                        }
+                                                                                    } catch (e) {}
+
+                                                                                    // ---- Video visibility recovery ----
+                                                                                    function ensureBaseHeights() {
+                                                                                        try {
+                                                                                            var de = document.documentElement;
+                                                                                            var body = document.body;
+                                                                                            if (de) {
+                                                                                                de.style.height = '100%';
+                                                                                                de.style.minHeight = '100%';
+                                                                                            }
+                                                                                            if (body) {
+                                                                                                body.style.height = '100%';
+                                                                                                body.style.minHeight = '100%';
+                                                                                            }
+                                                                                        } catch (e) {}
+                                                                                    }
+
+                                                                                    function ensureFixStyleInstalled() {
+                                                                                        try {
+                                                                                            if (document.getElementById('__localweb_video_fix_style')) return;
+                                                                                            var style = document.createElement('style');
+                                                                                            style.id = '__localweb_video_fix_style';
+                                                                                            style.textContent = [
+                                                                                                'html, body { height: 100% !important; min-height: 100% !important; }',
+                                                                                                'video { max-width: 100% !important; }'
+                                                                                            ].join('\n');
+                                                                                            (document.head || document.documentElement).appendChild(style);
+                                                                                        } catch (e) {}
+                                                                                    }
+
+                                                                                    function ensureVideoVisible(videoEl, reason) {
+                                                                                        try {
+                                                                                            if (!videoEl || videoEl.__localweb_forced_overlay__) return;
+                                                                                            ensureBaseHeights();
+                                                                                            ensureFixStyleInstalled();
+
+                                                                                            // Give layout a chance after updating vh.
+                                                                                            scheduleVh('ensureVideoVisible');
+
+                                                                                            var rect = videoEl.getBoundingClientRect ? videoEl.getBoundingClientRect() : null;
+                                                                                            var h = rect ? Math.round(rect.height) : -1;
+                                                                                            if (h > 1) return;
+
+                                                                                            videoEl.__localweb_forced_overlay__ = true;
+                                                                                            videoEl.style.position = 'fixed';
+                                                                                            videoEl.style.left = '0';
+                                                                                            videoEl.style.top = '0';
+                                                                                            videoEl.style.width = '100vw';
+                                                                                            videoEl.style.height = '100vh';
+                                                                                            videoEl.style.maxWidth = '100vw';
+                                                                                            videoEl.style.maxHeight = '100vh';
+                                                                                            videoEl.style.objectFit = 'contain';
+                                                                                            videoEl.style.zIndex = '2147483647';
+                                                                                            videoEl.style.backgroundColor = 'black';
+                                                                                            videoEl.style.display = 'block';
+                                                                                            videoEl.style.visibility = 'visible';
+                                                                                            videoEl.style.opacity = '1';
+
+                                                                                            console.log('[media-debug] applied video overlay fix:', 'reason=' + (reason || ''), 'src=' + (videoEl.currentSrc || videoEl.src || ''));
+                                                                                        } catch (e) {
+                                                                                            try { console.log('[media-debug] ensureVideoVisible failed:', safeToString(e && (e.message || e))); } catch (_e) {}
+                                                                                        }
+                                                                                    }
 
                                                                                     console.log('[media-debug] installed');
                                                                                 })();
