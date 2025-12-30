@@ -266,8 +266,8 @@
         }
       } catch (e) {}
 
-      // Keep the spinner for a tiny beat after playing starts (WebView can flash the glyph
-      // between ready and first stable frame).
+      // No extra delay: once playback is confirmed running/advancing, unhide immediately.
+      // Use requestAnimationFrame to keep the overlay covering at least one paint.
       try {
         if (videoEl.__localweb_hide_overlay_timer__) {
           clearTimeout(videoEl.__localweb_hide_overlay_timer__);
@@ -275,15 +275,13 @@
         }
       } catch (e) {}
       try {
-        videoEl.__localweb_hide_overlay_timer__ = setTimeout(function() {
+        requestAnimationFrame(function() {
           try {
-            videoEl.__localweb_hide_overlay_timer__ = null;
             hideLoadingOverlay();
             setVideoHiddenForSwitch(videoEl, false);
           } catch (e) {}
-        }, 1500);
+        });
       } catch (e) {
-        // If timers fail for some reason, do it immediately.
         try { hideLoadingOverlay(); } catch (_e) {}
         try { setVideoHiddenForSwitch(videoEl, false); } catch (_e) {}
       }
@@ -298,29 +296,45 @@
       if (document.getElementById('__localweb_video_loading_style')) return;
       var style = document.createElement('style');
       style.id = '__localweb_video_loading_style';
-      style.textContent = [
-        '.__localweb_video_loading_overlay {',
-        '  position: fixed;',
-        '  left: 0; top: 0;',
-        '  width: 0; height: 0;',
-        '  display: none;',
-        '  align-items: center;',
-        '  justify-content: center;',
-        '  z-index: 2147483647;',
-        // Opaque cover to hide WebView's native play glyph even if it draws outside CSS control.
-        '  background: rgba(0,0,0,0.90);',
-        '  pointer-events: none;',
-        '}',
-        '.__localweb_video_loading_overlay.__show { display: flex; }',
-        '.__localweb_spinner {',
-        '  width: 44px; height: 44px;',
-        '  border-radius: 50%;',
-        '  border: 4px solid rgba(255,255,255,0.28);',
-        '  border-top-color: rgba(255,255,255,0.85);',
-        '  animation: __localweb_spin 0.9s linear infinite;',
-        '}',
-        '@keyframes __localweb_spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }'
-      ].join('\n');
+      style.textContent = `
+      .__localweb_video_loading_overlay {
+        position: fixed;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+        display: none;
+        z-index: 2147483647;
+        background: transparent;
+        pointer-events: none;
+      }
+
+      .__localweb_video_loading_overlay.__show {
+        display: block;
+      }
+
+      .__localweb_spinner {
+        width: 44px;
+        height: 44px;
+        /* Position 30px from top and right edges */
+        position: absolute;
+        top: 30px;
+        right: 30px;
+        border-radius: 50%;
+        border: 4px solid rgba(255, 255, 255, 0.28);
+        border-top-color: rgba(255, 255, 255, 0.85);
+        animation: __localweb_spin 0.9s linear infinite;
+      }
+
+      @keyframes __localweb_spin {
+        from {
+          transform: rotate(0deg);
+        }
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      `;
       (document.head || document.documentElement).appendChild(style);
 
       var overlay = document.createElement('div');
